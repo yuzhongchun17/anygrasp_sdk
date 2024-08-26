@@ -7,6 +7,7 @@ from geometry_msgs.msg import TransformStamped
 from tf2_ros import TransformBroadcaster, TransformListener
 import tf2_ros
 import message_filters
+from tf.transformations import quaternion_from_euler, quaternion_multiply
 
 
 from cv_bridge import CvBridge
@@ -79,7 +80,7 @@ class ImageDataHandler:
 
     def timer_callback(self, event):
         if self.check_data_ready() and not self.is_grasp_predicted:
-            print("here")
+            # print("here")
             # self.debug_info()
             # self.visualize_pcd()
             # self.timestamp = self.camera_info.header.stamp
@@ -114,7 +115,8 @@ class ImageDataHandler:
 
         # Create a point cloud from the RGBD image
         fx, fy, cx, cy, scale = self.camera_info.K[0], self.camera_info.K[4], self.camera_info.K[2], self.camera_info.K[5], 1
-
+        # cx = -cx 
+        # cy = -cy
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd_image,
             o3d.camera.PinholeCameraIntrinsic(
@@ -167,12 +169,12 @@ class ImageDataHandler:
         print(points.min(axis=0), points.max(axis=0))
 
         # gg is a list of grasps of type graspgroup in graspnetAPI
-        xmin = points_x.min()
-        xmax = points_x.max()
-        ymin = points_y.min()
-        ymax = points_y.max()
+        xmin = -0.2
+        xmax = 0.2
+        ymin = -0.3
+        ymax = 0.3
         zmin = 0.4
-        zmax = 0.8
+        zmax = 0.7
         lims = [xmin, xmax, ymin, ymax, zmin, zmax]
 
         gg, cloud = anygrasp.get_grasp(points, colors, lims=lims, apply_object_mask=True, dense_grasp=False, collision_detection=True)
@@ -197,26 +199,36 @@ class ImageDataHandler:
                 gripper.transform(trans_mat)
             o3d.visualization.draw_geometries([*grippers, cloud])
             o3d.visualization.draw_geometries([grippers[0], cloud])
-    
+        
     def br_target_pose(self):
         # prepare tf for grasp pose (in lt frame)
         T_grasp_to_ee = np.array([[0,0,1],
                                   [1,0,0],
                                   [0,1,0]])
         rot_in_ee_frame = self.target_gg.rotation_matrix @ T_grasp_to_ee
-        # tf_grasp_pose = prepare_tf_msg('lt_tmp', 'grasp_pose', 
-        #                                None, 
-        #                                self.target_gg.translation, 
-        #                                self.target_gg.rotation_matrix)
+
         tf_grasp_pose = prepare_tf_msg('lt_tmp', 'grasp_pose', 
                                 None, 
                                 self.target_gg.translation, 
                                 rot_in_ee_frame)
+        tf_grasp_pose_flip = prepare_tf_msg('grasp_pose', 'grasp_pose_flip',
+                                       None,
+                                       [0,0,0],[0,0,1,0]) # also br the flipped grasp pose around z axis
+        
+        # manually define some pregrasp pose
+        tf_pregrasp = prepare_tf_msg('grasp_pose', 'pregrasp_pose',
+                                     None,
+                                     [0,0,-0.1],
+                                     [0,0,0,1])
+        tf_pregrasp_flip = prepare_tf_msg('pregrasp_pose', 'pregrasp_pose_flip',
+                                       None,
+                                       [0,0,0],[0,0,1,0]) 
+        
         # preprare tf for lt at time t (in hl_world frame)
         self.tf_lt_tmp.header.stamp = tf_grasp_pose.header.stamp
         self.tf_lt_tmp.child_frame_id = 'lt_tmp'
 
-        self.br.sendTransform([tf_grasp_pose, self.tf_lt_tmp])
+        self.br.sendTransform([tf_grasp_pose, tf_grasp_pose_flip, self.tf_lt_tmp, tf_pregrasp, tf_pregrasp_flip])
 
 if __name__ == '__main__':
     cfgs = parse_arguments()
@@ -224,26 +236,3 @@ if __name__ == '__main__':
 
     handler = ImageDataHandler(cfgs)
     rospy.spin()
-
-
-
-    # rospy.init_node('camera_data_handler', anonymous=True)
-    # self.depth_sub = rospy.Subscriber("/hololens2/image_lt", Image, self.depth_callback)
-    # self.rgb_sub = rospy.Subscriber("/hololens2/image_pv_remap", Image, self.rgb_callback)
-    # self.info_sub = rospy.Subscriber("/hololens2/camerainfo_lt", CameraInfo, self.info_callback)
-
-
-    # def rgb_callback(self, msg):
-    #     try:
-    #         self.rgb_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")  
-    #     except Exception as e:
-    #         rospy.logerr(f"Failed to convert pv image: {str(e)}")
-
-    # def depth_callback(self, img_msg):
-    #     try:
-    #         self.depth_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="32FC1")
-    #     except Exception as e:
-    #         rospy.logerr(f"Failed to convert depth image: {str(e)}")
-
-    # def info_callback(self, info_msg):
-    #     self.camera_info = info_msg
