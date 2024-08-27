@@ -168,13 +168,20 @@ class ImageDataHandler:
         # print(f'colors array size:{colors.shape}')
         print(points.min(axis=0), points.max(axis=0))
 
+        # Workspace for grasp predictions
         # gg is a list of grasps of type graspgroup in graspnetAPI
-        xmin = -0.2
-        xmax = 0.2
-        ymin = -0.3
-        ymax = 0.3
-        zmin = 0.4
-        zmax = 0.7
+        # xmin = -0.2 # tmp workspace 
+        # xmax = 0.2
+        # ymin = -0.3
+        # ymax = 0.3
+        # zmin = 0.4
+        # zmax = 0.7
+        xmin = points_x.min()
+        xmax = points_x.max()
+        ymin = points_y.min()
+        ymax = points_y.max()
+        zmin = points_z.min()
+        zmax = points_z.max()
         lims = [xmin, xmax, ymin, ymax, zmin, zmax]
 
         gg, cloud = anygrasp.get_grasp(points, colors, lims=lims, apply_object_mask=True, dense_grasp=False, collision_detection=True)
@@ -182,9 +189,9 @@ class ImageDataHandler:
             print('No Grasp detected after collision detection!')
 
         gg = gg.nms().sort_by_score()
-        gg_pick = gg[0:20]
+        # gg_pick = gg[0:20]
 
-        best_gg = gg_pick[0]
+        best_gg = gg[0]
         # print(gg_pick.scores)
         print('grasp score:', best_gg.score)
         # print(f'grasp translation:{type(best_gg.translation)} : and grasp rotation{type(best_gg.rotation_matrix)}')
@@ -199,6 +206,16 @@ class ImageDataHandler:
                 gripper.transform(trans_mat)
             o3d.visualization.draw_geometries([*grippers, cloud])
             o3d.visualization.draw_geometries([grippers[0], cloud])
+
+    # Given mask output from SAM2, get the 2d boundary value
+    def get_image_boundary(mask):
+        image_x_min,image_x_max,image_y_min,image_y_max = []
+        return image_x_min,image_x_max,image_y_min,image_y_max
+    
+    # Given 2d Image boundry, output filtered grasp pose        
+    def filter_gg(image_x_min, image_x_max, image_y_min, image_y_max):
+        filter_gg = []
+        return filter_gg
         
     def br_target_pose(self):
         # prepare tf for grasp pose (in lt frame)
