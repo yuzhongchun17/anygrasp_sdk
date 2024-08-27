@@ -9,7 +9,7 @@ import tf2_ros
 import message_filters
 from tf.transformations import quaternion_from_euler, quaternion_multiply
 
-
+import cv2
 from cv_bridge import CvBridge
 
 import argparse
@@ -20,6 +20,8 @@ import open3d as o3d
 from gsnet import AnyGrasp
 from graspnetAPI import GraspGroup
 from hl2ss_ros_utils import prepare_tf_msg
+
+from utils.camera import CameraParameters
 
 # Parse terminal input
 def parse_arguments():
@@ -36,12 +38,17 @@ class ImageDataHandler:
     def __init__(self, cfgs):
         self.cfgs = cfgs
 
+        # initialize camera parameters
+        self.cam = CameraParameters(0, 0, 0, 0, None, None, None)
+
         self.depth_image = None
         self.rgb_image = None
         self.camera_info = None
+        self.grasp_mask = None
         self.is_grasp_predicted = False
         
         self.target_gg = None
+        self.top_grasps = None
         self.tf_lt_tmp = TransformStamped() # the moment grasp is predicted
     
         # ROS ----------------------------------------------------------
@@ -55,9 +62,10 @@ class ImageDataHandler:
         self.rgb_sub = message_filters.Subscriber('/hololens2/image_pv_remap', Image)
         self.depth_sub = message_filters.Subscriber('/hololens2/image_lt', Image)
         self.info_sub = message_filters.Subscriber('/hololens2/camerainfo_lt', CameraInfo)
+        self.grasp_mask_sub = message_filters.Subscriber('/SAM2/mask', Image)
 
         # Set up a TimeSynchronizer (for sync sub)
-        self.ts = message_filters.TimeSynchronizer([self.rgb_sub, self.depth_sub, self.info_sub], 10)
+        self.ts = message_filters.TimeSynchronizer([self.rgb_sub, self.depth_sub, self.info_sub, self.grasp_mask_sub], 10)
         self.ts.registerCallback(self.callback)
 
         self.br = TransformBroadcaster()
@@ -65,12 +73,24 @@ class ImageDataHandler:
         self.timer = rospy.Timer(rospy.Duration(0.5), self.timer_callback)  # Adjust duration as needed
 
 
-    def callback(self, rgb_msg, depth_msg, info_msg):
+    def callback(self, rgb_msg, depth_msg, info_msg, grasp_mask_msg):
         try:
             # Process images
             self.rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "rgb8") # decode
             self.depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "32FC1")
-            self.camera_info = info_msg
+            self.camera_info = info_msg # CameraInfo
+            self.grasp_mask = self.bridge.imgmsg_to_cv2(grasp_mask_msg, "mono8") # biianry mask
+
+            # self.cam = CameraParameters(fx=info_msg.K[0],
+            #                             fy=info_msg.K[4],
+            #                             cx=info_msg.K[2],
+            #                             cy=info_msg.K[5],
+            #                             width=info_msg.width,
+            #                             height=info_msg.height,
+            #                             colors=self.bridge.imgmsg_to_cv2(rgb_msg, "rgb8"), # decode
+            #                             depths=self.bridge.imgmsg_to_cv2(depth_msg, "32FC1"),
+            #                             masks=self.bridge.imgmsg_to_cv2(mask_msg, "mono8"))
+
             # rospy.loginfo("Synchronized messages and TF received")
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
             rospy.logerr(f"Error getting TF transform: {str(e)}")
@@ -91,6 +111,7 @@ class ImageDataHandler:
             self.br_target_pose()
 
     def check_data_ready(self):
+        # return self.cam.depths is not None and self.cam.colors is not None and self.cam.fx is not None
         return self.depth_image is not None and self.rgb_image is not None and self.camera_info is not None
 
     # def debug_info(self):
@@ -101,6 +122,8 @@ class ImageDataHandler:
 
     def visualize_pcd(self):
         # Create Open3D color and depth images
+        # color_image = o3d.geometry.Image(self.cam.colors.astype(np.uint8))
+        # depth_image = o3d.geometry.Image(self.cam.depths.astype(np.float32))
         color_image = o3d.geometry.Image(self.rgb_image.astype(np.uint8))
         depth_image = o3d.geometry.Image(self.depth_image.astype(np.float32))
 
@@ -115,8 +138,6 @@ class ImageDataHandler:
 
         # Create a point cloud from the RGBD image
         fx, fy, cx, cy, scale = self.camera_info.K[0], self.camera_info.K[4], self.camera_info.K[2], self.camera_info.K[5], 1
-        # cx = -cx 
-        # cy = -cy
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd_image,
             o3d.camera.PinholeCameraIntrinsic(
@@ -128,7 +149,18 @@ class ImageDataHandler:
                 cy
             )
         )
-
+        # pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
+        #     rgbd_image,
+        #     o3d.camera.PinholeCameraIntrinsic(
+        #         self.camera_info.width,  # Assume intrinsic parameters are stored in cam_K
+        #         self.camera_info.height,
+        #         self.cam.fx,
+        #         self.cam.fy,
+        #         self.cam.cx,
+        #         self.cam.cy
+        #     )
+        # )
+        
         # Initialize visualization
         vis = o3d.visualization.Visualizer()
         vis.create_window()
@@ -150,7 +182,6 @@ class ImageDataHandler:
         self.tf_lt_tmp = self.tf_buffer.lookup_transform('hl_world', 'lt', self.t, rospy.Duration(1.0))
 
         fx, fy, cx, cy, scale = self.camera_info.K[0], self.camera_info.K[4], self.camera_info.K[2], self.camera_info.K[5], 1
-        # print(f'time stamp for prediction:{self.camera_info.header.fx}')
         # get point cloud
         xmap, ymap = np.arange(self.depth_image.shape[1]), np.arange(self.depth_image.shape[0])
         xmap, ymap = np.meshgrid(xmap, ymap)
@@ -162,10 +193,8 @@ class ImageDataHandler:
         # set your workspace to crop point cloud
         mask = (points_z > 0.3) & (points_z < 1)
         points = np.stack([points_x, points_y, points_z], axis=-1)
-        # print(f'points array size:{points.shape}')
         points = points[mask].astype(np.float32)
         colors = self.rgb_image[mask].astype(np.float32) / 255.0 # change to [0,1] from [0,255]
-        # print(f'colors array size:{colors.shape}')
         print(points.min(axis=0), points.max(axis=0))
 
         # Workspace for grasp predictions
@@ -189,12 +218,20 @@ class ImageDataHandler:
             print('No Grasp detected after collision detection!')
 
         gg = gg.nms().sort_by_score()
-        # gg_pick = gg[0:20]
 
+        # filter grasps based on grasp region mask
+        filtered_gg = self.filter_grasp(gg, self.grasp_mask)
+        filtered_gg = filtered_gg.nms().sort_by_score()
+        # Pick the best 10 grasp from the filtered grasps
+        if len(filtered_gg) < 10:
+            self.top_grasps = filtered_gg
+        else:
+            self.top_grasps = filtered_gg[0:10]
+
+        # gg_pick = gg[0:20]
         best_gg = gg[0]
         # print(gg_pick.scores)
-        print('grasp score:', best_gg.score)
-        # print(f'grasp translation:{type(best_gg.translation)} : and grasp rotation{type(best_gg.rotation_matrix)}')
+        # print('grasp score:', best_gg.score)
         self.target_gg = best_gg
 
         # visualization
@@ -207,16 +244,37 @@ class ImageDataHandler:
             o3d.visualization.draw_geometries([*grippers, cloud])
             o3d.visualization.draw_geometries([grippers[0], cloud])
 
-    # Given mask output from SAM2, get the 2d boundary value
-    def get_image_boundary(mask):
-        image_x_min,image_x_max,image_y_min,image_y_max = []
-        return image_x_min,image_x_max,image_y_min,image_y_max
+
+    # helper: get the bounding box of the mask
+    def get_bbox(mask):
+        x, y, w, h = cv2.boundingRect(mask)
+        # output the bounding box in the form of (x_min, x_max, y_min, y_max)
+        return x, x+w, y, y+h
     
-    # Given 2d Image boundry, output filtered grasp pose        
-    def filter_gg(image_x_min, image_x_max, image_y_min, image_y_max):
-        filter_gg = []
-        return filter_gg
-        
+    def filter_grasp(self, gg, mask):
+        # get 2d bounding box of the mask
+        x_min, x_max, y_min, y_max = self.get_bbox(mask)
+
+        # get grasp centers in 2d from 3d for each grasp
+        filtered_gg = []
+        for grasp in gg:
+            grasp_center_3d = grasp.translation # 3d grasp center
+            grasp_center_2d = self.project_3d_to_2d(grasp_center_3d)
+            # check if the grasp center is within the bounding box
+            if x_min < grasp_center_2d[0] < x_max and y_min < grasp_center_2d[1] < y_max:
+                filtered_gg.append(grasp)
+        return filtered_gg
+
+    # helper: project 3D point [X, Y, Z] to 2D pixel [image_x, image_y]
+    def project_3d_to_2d(self, point):
+        X, Y, Z = point
+        fx, fy, cx, cy = self.camera_info.K[0], self.camera_info.K[4], self.camera_info.K[2], self.camera_info.K[5]
+        image_x = (X/Z) * fx + cx
+        image_y = (Y/Z) * fy + cy
+        return int(image_x), int(image_y)
+
+
+    # helper: broadcast the target pose
     def br_target_pose(self):
         # prepare tf for grasp pose (in lt frame)
         T_grasp_to_ee = np.array([[0,0,1],
