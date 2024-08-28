@@ -21,7 +21,7 @@ from gsnet import AnyGrasp
 from graspnetAPI import GraspGroup
 from hl2ss_ros_utils import prepare_tf_msg
 
-from utils.camera import CameraParameters
+# from utils.camera import CameraParameters
 
 # Parse terminal input
 def parse_arguments():
@@ -39,7 +39,7 @@ class ImageDataHandler:
         self.cfgs = cfgs
 
         # initialize camera parameters
-        self.cam = CameraParameters(0, 0, 0, 0, None, None, None)
+        # self.cam = CameraParameters(0, 0, 0, 0, None, None, None)
 
         self.depth_image = None
         self.rgb_image = None
@@ -62,10 +62,10 @@ class ImageDataHandler:
         self.rgb_sub = message_filters.Subscriber('/hololens2/image_pv_remap', Image)
         self.depth_sub = message_filters.Subscriber('/hololens2/image_lt', Image)
         self.info_sub = message_filters.Subscriber('/hololens2/camerainfo_lt', CameraInfo)
-        self.grasp_mask_sub = message_filters.Subscriber('/SAM2/mask', Image)
+        # self.grasp_mask_sub = message_filters.Subscriber('/SAM2/mask', Image)
 
         # Set up a TimeSynchronizer (for sync sub)
-        self.ts = message_filters.TimeSynchronizer([self.rgb_sub, self.depth_sub, self.info_sub, self.grasp_mask_sub], 10)
+        self.ts = message_filters.TimeSynchronizer([self.rgb_sub, self.depth_sub, self.info_sub], 10)
         self.ts.registerCallback(self.callback)
 
         self.br = TransformBroadcaster()
@@ -73,13 +73,13 @@ class ImageDataHandler:
         self.timer = rospy.Timer(rospy.Duration(0.5), self.timer_callback)  # Adjust duration as needed
 
 
-    def callback(self, rgb_msg, depth_msg, info_msg, grasp_mask_msg):
+    def callback(self, rgb_msg, depth_msg, info_msg):
         try:
             # Process images
             self.rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "rgb8") # decode
             self.depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "32FC1")
             self.camera_info = info_msg # CameraInfo
-            self.grasp_mask = self.bridge.imgmsg_to_cv2(grasp_mask_msg, "mono8") # biianry mask
+            # self.grasp_mask = self.bridge.imgmsg_to_cv2(grasp_mask_msg, "mono8") # biianry mask
 
             # self.cam = CameraParameters(fx=info_msg.K[0],
             #                             fy=info_msg.K[4],
@@ -108,7 +108,8 @@ class ImageDataHandler:
             self.is_grasp_predicted = True
         if self.is_grasp_predicted:
             # print("br grasp_pose")
-            self.br_target_pose()
+            # self.br_target_pose()
+            self.br_grasps()
 
     def check_data_ready(self):
         # return self.cam.depths is not None and self.cam.colors is not None and self.cam.fx is not None
@@ -219,19 +220,20 @@ class ImageDataHandler:
 
         gg = gg.nms().sort_by_score()
 
-        # filter grasps based on grasp region mask
-        filtered_gg = self.filter_grasp(gg, self.grasp_mask)
-        filtered_gg = filtered_gg.nms().sort_by_score()
-        # Pick the best 10 grasp from the filtered grasps
-        if len(filtered_gg) < 10:
+        # # filter grasps based on grasp region mask
+        # filtered_gg = self.filter_grasp(gg, self.grasp_mask)
+        # filtered_gg = filtered_gg.nms().sort_by_score()
+        # # Pick the best 10 grasp from the filtered grasps
+
+        # place holder for filtered grasps
+        filtered_gg = gg
+        # output top 5 grasps or less
+        if len(filtered_gg) < 5:
             self.top_grasps = filtered_gg
         else:
-            self.top_grasps = filtered_gg[0:10]
+            self.top_grasps = filtered_gg[0:5]
 
-        # gg_pick = gg[0:20]
         best_gg = gg[0]
-        # print(gg_pick.scores)
-        # print('grasp score:', best_gg.score)
         self.target_gg = best_gg
 
         # visualization
@@ -245,25 +247,25 @@ class ImageDataHandler:
             o3d.visualization.draw_geometries([grippers[0], cloud])
 
 
-    # helper: get the bounding box of the mask
-    def get_bbox(mask):
-        x, y, w, h = cv2.boundingRect(mask)
-        # output the bounding box in the form of (x_min, x_max, y_min, y_max)
-        return x, x+w, y, y+h
+    # # helper: get the bounding box of the mask
+    # def get_bbox(mask):
+    #     x, y, w, h = cv2.boundingRect(mask)
+    #     # output the bounding box in the form of (x_min, x_max, y_min, y_max)
+    #     return x, x+w, y, y+h
     
-    def filter_grasp(self, gg, mask):
-        # get 2d bounding box of the mask
-        x_min, x_max, y_min, y_max = self.get_bbox(mask)
+    # def filter_grasp(self, gg, mask):
+    #     # get 2d bounding box of the mask
+    #     x_min, x_max, y_min, y_max = self.get_bbox(mask)
 
-        # get grasp centers in 2d from 3d for each grasp
-        filtered_gg = []
-        for grasp in gg:
-            grasp_center_3d = grasp.translation # 3d grasp center
-            grasp_center_2d = self.project_3d_to_2d(grasp_center_3d)
-            # check if the grasp center is within the bounding box
-            if x_min < grasp_center_2d[0] < x_max and y_min < grasp_center_2d[1] < y_max:
-                filtered_gg.append(grasp)
-        return filtered_gg
+    #     # get grasp centers in 2d from 3d for each grasp
+    #     filtered_gg = []
+    #     for grasp in gg:
+    #         grasp_center_3d = grasp.translation # 3d grasp center
+    #         grasp_center_2d = self.project_3d_to_2d(grasp_center_3d)
+    #         # check if the grasp center is within the bounding box
+    #         if x_min < grasp_center_2d[0] < x_max and y_min < grasp_center_2d[1] < y_max:
+    #             filtered_gg.append(grasp)
+    #     return filtered_gg
 
     # helper: project 3D point [X, Y, Z] to 2D pixel [image_x, image_y]
     def project_3d_to_2d(self, point):
@@ -274,13 +276,44 @@ class ImageDataHandler:
         return int(image_x), int(image_y)
 
 
+    # helper: get the rotation matrix of the camera in the robot end effector frame
+    def get_cam_ee_rotation(self):
+        Rot_cam_ee = np.array([[0, 0, 1],
+                               [1, 0, 0],
+                               [0, 1, 0]])
+        return Rot_cam_ee
+    
+    # helper: publish all the grasps and pregrasps as tf relative to lt_tmp
+    def br_grasps(self):
+        # prepare tf for each grasp (in lt frame)
+        R_cam_ee = self.get_cam_ee_rotation()
+        tf_list = []
+        for i, grasp in enumerate(self.top_grasps):
+            rot_in_ee_frame = grasp.rotation_matrix @ R_cam_ee
+            tf_grasp = prepare_tf_msg('lt_tmp', f'grasp_{i}', 
+                                      None, 
+                                      grasp.translation, 
+                                      rot_in_ee_frame)
+            
+            tf_pregrasp = prepare_tf_msg(f'grasp_{i}', f'pregrasp_{i}',
+                                        None,
+                                        [0,0,-0.1],
+                                        [0,0,0,1])
+            tf_list.append(tf_grasp)
+            tf_list.append(tf_pregrasp)
+
+        # tf: hl_world -> lt_tmp
+        self.tf_lt_tmp.header.stamp = rospy.Time.now()
+        self.tf_lt_tmp.child_frame_id = 'lt_tmp'
+        tf_list.append(self.tf_lt_tmp)
+        
+        self.br.sendTransform(tf_list)
+
     # helper: broadcast the target pose
     def br_target_pose(self):
         # prepare tf for grasp pose (in lt frame)
-        T_grasp_to_ee = np.array([[0,0,1],
-                                  [1,0,0],
-                                  [0,1,0]])
-        rot_in_ee_frame = self.target_gg.rotation_matrix @ T_grasp_to_ee
+        R_cam_ee = self.get_cam_ee_rotation()
+        rot_in_ee_frame = self.target_gg.rotation_matrix @ R_cam_ee
 
         tf_grasp_pose = prepare_tf_msg('lt_tmp', 'grasp_pose', 
                                 None, 
@@ -299,7 +332,7 @@ class ImageDataHandler:
                                        None,
                                        [0,0,0],[0,0,1,0]) 
         
-        # preprare tf for lt at time t (in hl_world frame)
+        # tf: hl_world -> lt_tmp
         self.tf_lt_tmp.header.stamp = tf_grasp_pose.header.stamp
         self.tf_lt_tmp.child_frame_id = 'lt_tmp'
 
