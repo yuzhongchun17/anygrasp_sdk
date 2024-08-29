@@ -8,6 +8,7 @@ import open3d as o3d
 import rospy
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import TransformStamped
+from std_msgs.msg import Bool
 from tf2_ros import TransformBroadcaster, TransformListener
 import tf2_ros
 from tf.transformations import quaternion_from_euler, quaternion_multiply
@@ -44,6 +45,7 @@ class ImageBasedGraspPrediction:
         # Flags
         self.is_grasp_filtered = False
         self.is_visualized = False
+        self.start_prediction = None
         
         self.tf_lt_tmp = TransformStamped() # the moment grasp is predicted
 
@@ -74,7 +76,17 @@ class ImageBasedGraspPrediction:
         # Subscribe to the grasp mask (tested)
         self.grasp_mask_sub = rospy.Subscriber('/hololens2/grasp_mask', Image, self.mask_callback)
 
+        # Subscribeb to the trigger (bool) to start the grasping process
+        self.trigger_sub = rospy.Subscriber('/grasp_trigger', Bool, self.trigger_callback)
+
     # Functions to check if data is ready --------------------------------
+    def check_trigger_ready(self):
+        if self.start_prediction is None:
+            rospy.loginfo_once('Waiting for trigger...')
+        else:
+            rospy.loginfo_once(f'Trigger received: {self.start_prediction}')   
+        return self.start_prediction is not None
+    
     def check_grasp_ready(self):
         return self.gg is not None
 
@@ -92,6 +104,9 @@ class ImageBasedGraspPrediction:
         return self.depth_image is not None and self.rgb_image is not None and self.camera_info is not None
     
     # Callbacks ---------------------------------------------------------
+    def trigger_callback(self, trigger_msg):
+        self.start_prediction = trigger_msg.data
+                                           
     def mask_callback(self, mask_msg):
         try:
             self.grasp_mask = self.bridge.imgmsg_to_cv2(mask_msg, "mono8") # binary mask
@@ -112,17 +127,18 @@ class ImageBasedGraspPrediction:
             rospy.logerr(f"Error processing synchronized messages: {str(e)}")
 
     def timer_callback(self, event):
-        if self.check_data_ready() and not self.check_grasp_ready():
-            # utils.visualize_pcd(self.rgb_image, self.depth_image, self.camera_info)
-            self.predict_grasp() # update self.gg (once)
+        if self.check_trigger_ready() and self.start_prediction:
+            if self.check_data_ready() and not self.check_grasp_ready():
+                # utils.visualize_pcd(self.rgb_image, self.depth_image, self.camera_info)
+                self.predict_grasp() # update self.gg (once)
 
-        if self.check_grasp_mask_ready() and self.check_grasp_ready() and not self.check_filtered_grasp_ready():
-            self.filter_grasp() # update self.filtered_gg (once)
+            if self.check_grasp_mask_ready() and self.check_grasp_ready() and not self.check_filtered_grasp_ready():
+                self.filter_grasp() # update self.filtered_gg (once)
 
-        if self.check_filtered_grasp_ready():
-            if cfgs.debug:
-                self.visualize_grasps()
-            self.br_grasps()
+            if self.check_filtered_grasp_ready():
+                if cfgs.debug:
+                    self.visualize_grasps()
+                self.br_grasps()
 
     # Main functions ----------------------------------------------------
     def predict_grasp(self):
