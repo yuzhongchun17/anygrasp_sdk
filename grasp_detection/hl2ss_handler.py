@@ -42,7 +42,6 @@ class ImageBasedGraspPrediction:
         self.grasp_mask = None
 
         # Flags
-        self.is_grasp_predicted = False
         self.is_grasp_filtered = False
         self.is_visualized = False
         
@@ -75,6 +74,24 @@ class ImageBasedGraspPrediction:
         # Subscribe to the grasp mask (tested)
         self.grasp_mask_sub = rospy.Subscriber('/hololens2/grasp_mask', Image, self.mask_callback)
 
+    # Functions to check if data is ready --------------------------------
+    def check_grasp_ready(self):
+        return self.gg is not None
+
+    def check_filtered_grasp_ready(self):
+        return self.filtered_gg is not None
+    
+    def check_grasp_mask_ready(self):
+        if self.grasp_mask is not None:
+            rospy.loginfo_once('Grasp mask received')
+        else:
+            rospy.loginfo_once('Waiting for grasp mask...')
+        return self.grasp_mask is not None
+    
+    def check_data_ready(self):
+        return self.depth_image is not None and self.rgb_image is not None and self.camera_info is not None
+    
+    # Callbacks ---------------------------------------------------------
     def mask_callback(self, mask_msg):
         try:
             self.grasp_mask = self.bridge.imgmsg_to_cv2(mask_msg, "mono8") # binary mask
@@ -96,8 +113,7 @@ class ImageBasedGraspPrediction:
 
     def timer_callback(self, event):
         if self.check_data_ready() and not self.check_grasp_ready():
-            # self.debug_info()
-            # self.visualize_pcd()
+            # utils.visualize_pcd(self.rgb_image, self.depth_image, self.camera_info)
             self.predict_grasp() # update self.gg (once)
 
         if self.check_grasp_mask_ready() and self.check_grasp_ready() and not self.check_filtered_grasp_ready():
@@ -108,69 +124,12 @@ class ImageBasedGraspPrediction:
                 self.visualize_grasps()
             self.br_grasps()
 
-    def check_grasp_ready(self):
-        return self.gg is not None
-
-    def check_filtered_grasp_ready(self):
-        return self.filtered_gg is not None
-    
-    def check_grasp_mask_ready(self):
-        if self.grasp_mask is not None:
-            rospy.loginfo_once('Grasp mask received')
-        else:
-            rospy.loginfo_once('Waiting for grasp mask...')
-        return self.grasp_mask is not None
-    
-    def check_data_ready(self):
-        return self.depth_image is not None and self.rgb_image is not None and self.camera_info is not None
-
-    # def debug_info(self):
-    #     rospy.loginfo("Processing images...")
-    #     print(f'Depth image shape: {self.depth_image.shape}')
-    #     print(f'Color image shape: {self.rgb_image.shape}')
-    #     print(f'Camera intrinsics K matrix: {self.camera_info.K}')
-
-    # TODO: move it to utils, remove self
-    def visualize_pcd(self):
-        # Create Open3D color and depth images
-        color_image = o3d.geometry.Image(self.rgb_image.astype(np.uint8))
-        depth_image = o3d.geometry.Image(self.depth_image.astype(np.float32))
-
-        # Create RGBD image from color and depth images
-        rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color_image,
-            depth_image,
-            depth_scale=1.0,  # Assume depth scale is 1000 for converting to meters
-            depth_trunc=2.0,     # Truncate depth beyond __ [m]
-            convert_rgb_to_intensity=False
-        )
-
-        # Create a point cloud from the RGBD image
-        fx, fy, cx, cy, scale = self.camera_info.K[0], self.camera_info.K[4], self.camera_info.K[2], self.camera_info.K[5], 1
-        pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
-            rgbd_image,
-            o3d.camera.PinholeCameraIntrinsic(
-                self.camera_info.width,  # Assume intrinsic parameters are stored in cam_K
-                self.camera_info.height,
-                fx,
-                fy,
-                cx,
-                cy
-            )
-        )
-
-        # Initialize visualization
-        vis = o3d.visualization.Visualizer()
-        vis.create_window()
-        
-        # Add point cloud to visualizer
-        vis.add_geometry(pcd)
-        
-        # Run the visualizer
-        vis.run()
-        # vis.destroy_window()
-
+    # Main functions ----------------------------------------------------
     def predict_grasp(self):
+        """
+        Predict grasps using the AnyGrasp model
+        update: self.gg, self.cloud
+        """
         anygrasp = AnyGrasp(cfgs)
         anygrasp.load_net()
        
@@ -184,7 +143,6 @@ class ImageBasedGraspPrediction:
         xmap, ymap = np.arange(self.depth_image.shape[1]), np.arange(self.depth_image.shape[0])
         xmap, ymap = np.meshgrid(xmap, ymap)
         points_z = self.depth_image / scale
-        # print(points_z)
         points_x = (xmap - cx) / fx * points_z
         points_y = (ymap - cy) / fy * points_z
 
@@ -195,8 +153,7 @@ class ImageBasedGraspPrediction:
         colors = self.rgb_image[mask].astype(np.float32) / 255.0 # change to [0,1] from [0,255]
         # print(points.min(axis=0), points.max(axis=0))
 
-        # Workspace for grasp predictions
-        # gg is a list of grasps of type graspgroup in graspnetAPI
+        # Workspace for grasp predictions (gg : GraspGroup)
         xmin = points_x.min()
         xmax = points_x.max()
         ymin = points_y.min()
@@ -208,16 +165,19 @@ class ImageBasedGraspPrediction:
         gg, cloud = anygrasp.get_grasp(points, colors, lims=lims, apply_object_mask=True, dense_grasp=False, collision_detection=True)
         if len(gg) == 0:
             print('No Grasp detected after collision detection!')
-
         gg = gg.nms().sort_by_score()
 
-        # OUTPUT of the function
         self.gg = gg # update all predicted grasps
-        rospy.loginfo(f'Number of grasps: {len(self.gg)}')
         self.cloud = cloud # update the point cloud
 
-    # helper: debug function to visualize the predicted grasps in 3D (tested)
+        rospy.loginfo(f'Number of grasps: {len(self.gg)}')
+
     def visualize_grasps(self):
+        """
+        Visualize all grasps and filtered grasps
+        
+        flag: self.is_visualized
+        """
         # run visualization only once
         if not self.is_visualized:
             self.is_visualized = True
@@ -231,7 +191,7 @@ class ImageBasedGraspPrediction:
             for gripper in grippers:
                 gripper.transform(trans_mat)
             rospy.loginfo('Visualizing all grasps...')
-            o3d.visualization.draw_geometries([*grippers, cloud]) #visualize all grasps
+            o3d.visualization.draw_geometries([*grippers, cloud]) 
             # o3d.visualization.draw_geometries([grippers[0], cloud]) #visualize the best grasp
 
             # visualize filtered grasps
@@ -239,34 +199,24 @@ class ImageBasedGraspPrediction:
             for filtered_gripper in filtered_grippers:
                 filtered_gripper.transform(trans_mat)  
             rospy.loginfo('Visualizing filtered grasps...')
-            o3d.visualization.draw_geometries([*filtered_grippers, cloud]) #visualize filtered grasps
-
-    # TODO: move it to utils
-    def get_bbox(self, mask):
-        """ Get the bounding box of a binary mask."""
-        x, y, w, h = cv2.boundingRect(mask)
-        # output the bounding box in the form of (x_min, x_max, y_min, y_max)
-        return x, x+w, y, y+h
-    
-    # TODO: move it to utils
-    # helper: project 3D point [X, Y, Z] to 2D pixel [image_x, image_y]
-    def project_3d_pts_to_2d(self, point):
-        X, Y, Z = point
-        fx, fy, cx, cy = self.camera_info.K[0], self.camera_info.K[4], self.camera_info.K[2], self.camera_info.K[5]
-        image_x = (X/Z) * fx + cx
-        image_y = (Y/Z) * fy + cy
-        return int(image_x), int(image_y)
+            o3d.visualization.draw_geometries([*filtered_grippers, cloud]) 
     
     def filter_grasp(self, num_grasp=5):
+        """
+        Filter grasps based on the grasp mask
+        
+        update: self.filtered_gg
+        flag: self.is_grasp_filtered
+        """
         if not self.is_grasp_filtered:
             # get 2d bounding box of the mask
-            x_min, x_max, y_min, y_max = self.get_bbox(self.grasp_mask)
+            x_min, x_max, y_min, y_max = utils.get_bbox(self.grasp_mask)
 
             # get grasp centers in 2d from 3d for each grasp
             filtered_gg_index = []
             for i in range(len(self.gg)):
                 grasp_center_3d = self.gg[i].translation # 3d grasp center
-                grasp_center_2d = self.project_3d_pts_to_2d(grasp_center_3d)
+                grasp_center_2d = utils.project_3d_to_2d(grasp_center_3d, self.camera_info) 
                 # check if the grasp center is within the bounding box
                 if x_min < grasp_center_2d[0] < x_max and y_min < grasp_center_2d[1] < y_max:
                     filtered_gg_index.append(i)
@@ -285,18 +235,12 @@ class ImageBasedGraspPrediction:
             # set the flag 
             self.is_grasp_filtered = True
 
-    # TODO: move it to utils
-    # helper: get the rotation matrix of the camera in the robot end effector frame
-    def get_cam_ee_rotation(self):
-        Rot_cam_ee = np.array([[0, 0, 1],
-                               [1, 0, 0],
-                               [0, 1, 0]])
-        return Rot_cam_ee
-    
-    # helper: publish all the grasps and pregrasps as tf relative to lt_tmp
     def br_grasps(self):
+        """
+        Publish all the grasps and pregrasps as tf relative to lt_tmp
+        """
         # prepare tf for each grasp (in lt frame)
-        R_cam_ee = self.get_cam_ee_rotation()
+        R_cam_ee = utils.get_cam_ee_rotation()
         tf_list = []
         for i, grasp in enumerate(self.filtered_gg):
             rot_in_ee_frame = grasp.rotation_matrix @ R_cam_ee
@@ -323,6 +267,5 @@ class ImageBasedGraspPrediction:
 if __name__ == '__main__':
     cfgs = parse_arguments()
     cfgs.max_gripper_width = max(0, min(0.1, cfgs.max_gripper_width))
-
     handler = ImageBasedGraspPrediction(cfgs)
     rospy.spin()
