@@ -15,7 +15,7 @@ def publish_dummy_mask():
     dummy_channels = 1  # Grayscale image
 
     # Define a medium-sized white ball
-    ball_radius = dummy_height // 5  
+    ball_radius = dummy_height // 3
     center_x, center_y = dummy_width // 2, dummy_height // 2  # Center of the image
 
     while not rospy.is_shutdown():
