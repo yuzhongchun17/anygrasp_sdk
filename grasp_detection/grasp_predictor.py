@@ -44,7 +44,6 @@ class GraspPredictor:
         self.grasp_mask = None
 
         # Flags
-        self.is_grasp_filtered = False
         self.is_visualized = False
         self.start_prediction = None
         
@@ -88,14 +87,17 @@ class GraspPredictor:
 
     def is_filtered_grasp_predicted(self):
         return self.filtered_gg is not None
-    
+    # Reset functions --------------------------------------------------
+    # TODO: figure out the reset logic (onlyl needed in sam2_clientn to stop publihing goals)
+    # TODO: and in mask handler to stop publishing mask
+
     # Callbacks ---------------------------------------------------------                                           
     def mask_callback(self, mask_msg):
         try:
             self.grasp_mask = self.bridge.imgmsg_to_cv2(mask_msg, "mono8") # binary mask
             rospy.loginfo_once('Grasp mask received')
         except Exception as e:
-            rospy.logerr(f"Error processing grasp mask msg: {str(e)}")
+            rospy.logerr(f"Error processing grasp mask msg: {str(e)}")  
    
     # Sync callback
     def callback(self, rgb_msg, depth_msg, info_msg):
@@ -132,21 +134,19 @@ class GraspPredictor:
         anygrasp = AnyGrasp(cfgs)
         anygrasp.load_net()
        
-        # get camera parameters
+        # Get the point cloud from RGBD + CameraInfo
         fx, fy, cx, cy, scale = self.camera_info_lt.K[0], self.camera_info_lt.K[4], self.camera_info_lt.K[2], self.camera_info_lt.K[5], 1
-        # get point cloud
         xmap, ymap = np.arange(self.depth_image.shape[1]), np.arange(self.depth_image.shape[0])
         xmap, ymap = np.meshgrid(xmap, ymap)
         points_z = self.depth_image / scale
         points_x = (xmap - cx) / fx * points_z
         points_y = (ymap - cy) / fy * points_z
 
-        # set your workspace to crop point cloud
+        # Set workspace to crop point cloud
         mask = (points_z > 0.3) & (points_z < 1)
         points = np.stack([points_x, points_y, points_z], axis=-1)
         points = points[mask].astype(np.float32)
         colors = self.rgb_image[mask].astype(np.float32) / 255.0 # change to [0,1] from [0,255]
-        # print(points.min(axis=0), points.max(axis=0))
 
         # Workspace for grasp predictions (gg : GraspGroup)
         xmin = points_x.min()
@@ -162,8 +162,9 @@ class GraspPredictor:
             print('No Grasp detected after collision detection!')
         gg = gg.nms().sort_by_score()
 
-        self.gg = gg # update all predicted grasps
-        self.cloud = cloud # update the point cloud
+        # Update grasp variables
+        self.gg = gg 
+        self.cloud = cloud 
 
         rospy.loginfo(f'Number of grasps: {len(self.gg)}')
 
@@ -175,26 +176,22 @@ class GraspPredictor:
         update: self.filtered_gg
         flag: self.is_grasp_filtered
         """
-        if not self.is_grasp_filtered:
-            # Filter grasps based on the grasp mask
-            filtered_gg_index = []
-            for i in range(len(self.gg)):
-                grasp_center_3d = self.gg[i].translation 
-                grasp_center_2d = utils.project_3d_to_2d(grasp_center_3d, self.camera_info_lt) 
-                if utils.is_grasp_within_mask(grasp_center_2d, self.grasp_mask):
-                    filtered_gg_index.append(i)
-            filtered_gg = self.gg[filtered_gg_index]
+        # Filter grasps based on the grasp mask
+        filtered_gg_index = []
+        for i in range(len(self.gg)):
+            grasp_center_3d = self.gg[i].translation 
+            grasp_center_2d = utils.project_3d_to_2d(grasp_center_3d, self.camera_info_lt) 
+            if utils.is_grasp_within_mask(grasp_center_2d, self.grasp_mask):
+                filtered_gg_index.append(i)
+        filtered_gg = self.gg[filtered_gg_index]
 
-            # Only return the top num_grasp grasps      
-            if len(filtered_gg) < num_grasp:
-                rospy.loginfo(f'Number of filtered grasps is {len(filtered_gg)}, returning all grasps')
-                self.filtered_gg = filtered_gg
-            else:
-                rospy.loginfo(f'Number of filtered grasps is {len(filtered_gg)}, returning top {num_grasp} grasps')
-                self.filtered_gg = filtered_gg[0:num_grasp]          
-
-            # Set the flag
-            self.is_grasp_filtered = True
+        # Only return the top num_grasp grasps      
+        if len(filtered_gg) < num_grasp:
+            rospy.loginfo(f'Number of filtered grasps is {len(filtered_gg)}, returning all grasps')
+            self.filtered_gg = filtered_gg
+        else:
+            rospy.loginfo(f'Number of filtered grasps is {len(filtered_gg)}, returning top {num_grasp} grasps')
+            self.filtered_gg = filtered_gg[0:num_grasp]          
 
     def visualize_grasps(self):
         """
@@ -202,7 +199,7 @@ class GraspPredictor:
         
         flag: self.is_visualized
         """
-        # run visualization only once
+        # Visualize only once
         if not self.is_visualized:
             self.is_visualized = True
 
@@ -210,7 +207,7 @@ class GraspPredictor:
             cloud = self.cloud
             cloud.transform(trans_mat)
 
-            # visualize all grasps
+            # Visualize all grasps
             grippers = self.gg.to_open3d_geometry_list()
             for gripper in grippers:
                 gripper.transform(trans_mat)
@@ -218,7 +215,7 @@ class GraspPredictor:
             o3d.visualization.draw_geometries([*grippers, cloud]) 
             # o3d.visualization.draw_geometries([grippers[0], cloud]) #visualize the best grasp
 
-            # visualize filtered grasps
+            # Visualize filtered grasps
             filtered_grippers = self.filtered_gg.to_open3d_geometry_list()
             for filtered_gripper in filtered_grippers:
                 filtered_gripper.transform(trans_mat)  
