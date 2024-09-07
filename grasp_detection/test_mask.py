@@ -6,7 +6,7 @@ import cv2  # Import OpenCV for drawing the ball
 
 def publish_dummy_mask():
     rospy.init_node('dummy_mask_publisher', anonymous=True)
-    pub = rospy.Publisher('/hololens2/grasp_mask', Image, queue_size=10)
+    pub = rospy.Publisher('/hololens2/grasp_mask_pv', Image, queue_size=10)
     rate = rospy.Rate(10)  # 10hz
 
     # Image dimensions and properties
