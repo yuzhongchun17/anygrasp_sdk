@@ -54,7 +54,7 @@ class GraspPredictor:
         self.cloud = None # will store the point cloud
     
         rospy.init_node('Anygrasp', anonymous=True)
-        rospy.loginfo_once('Anygrasp node initialized')
+        rospy.loginfo_once('(Anygrasp) Anygrasp node initialized')
         # ROS ----------------------------------------------------------
         # Initialize the CvBridge and TF2 listener
         self.bridge = CvBridge()
@@ -95,9 +95,9 @@ class GraspPredictor:
     def mask_callback(self, mask_msg):
         try:
             self.grasp_mask = self.bridge.imgmsg_to_cv2(mask_msg, "mono8") # binary mask
-            rospy.loginfo_once('Grasp mask received')
+            rospy.loginfo_once('(Anygrasp) Grasp mask received')
         except Exception as e:
-            rospy.logerr(f"Error processing grasp mask msg: {str(e)}")  
+            rospy.logerr(f"(Anygrasp) Error processing grasp mask msg: {str(e)}")  
    
     # Sync callback
     def callback(self, rgb_msg, depth_msg, info_msg):
@@ -107,10 +107,10 @@ class GraspPredictor:
             self.camera_info_lt = info_msg 
 
         except Exception as e:
-            rospy.logerr(f"Error processing synchronized messages: {str(e)}")
+            rospy.logerr(f"(Anygrasp) Error processing synchronized messages: {str(e)}")
 
     def timer_callback(self, event):
-        rospy.loginfo_once('Timer callback triggered')
+        rospy.loginfo_once('(Anygrasp) Timer callback triggered')
         if self.is_rgbd_info_ready() and not self.is_grasp_predicted():
             # NOTE: RGBD ready, but grasp not predicted yet
             # utils.visualize_pcd(self.rgb_image, self.depth_image, self.camera_info)
@@ -159,14 +159,14 @@ class GraspPredictor:
 
         gg, cloud = anygrasp.get_grasp(points, colors, lims=lims, apply_object_mask=True, dense_grasp=False, collision_detection=True)
         if len(gg) == 0:
-            print('No Grasp detected after collision detection!')
+            print('(Anygrasp) No Grasp detected after collision detection!')
         gg = gg.nms().sort_by_score()
 
         # Update grasp variables
         self.gg = gg 
         self.cloud = cloud 
 
-        rospy.loginfo(f'Number of grasps: {len(self.gg)}')
+        rospy.loginfo(f'(Anygrasp) Number of grasps: {len(self.gg)}')
 
     
     def filter_grasp(self, num_grasp=5):
@@ -187,10 +187,10 @@ class GraspPredictor:
 
         # Only return the top num_grasp grasps      
         if len(filtered_gg) < num_grasp:
-            rospy.loginfo(f'Number of filtered grasps is {len(filtered_gg)}, returning all grasps')
+            rospy.loginfo(f'(Anygrasp) Number of filtered grasps is {len(filtered_gg)}, returning all grasps')
             self.filtered_gg = filtered_gg
         else:
-            rospy.loginfo(f'Number of filtered grasps is {len(filtered_gg)}, returning top {num_grasp} grasps')
+            rospy.loginfo(f'(Anygrasp) Number of filtered grasps is {len(filtered_gg)}, returning top {num_grasp} grasps')
             self.filtered_gg = filtered_gg[0:num_grasp]          
 
     def visualize_grasps(self):
@@ -211,7 +211,7 @@ class GraspPredictor:
             grippers = self.gg.to_open3d_geometry_list()
             for gripper in grippers:
                 gripper.transform(trans_mat)
-            rospy.loginfo('Visualizing all grasps...')
+            rospy.loginfo('(Anygrasp) Visualizing all grasps...')
             o3d.visualization.draw_geometries([*grippers, cloud]) 
             # o3d.visualization.draw_geometries([grippers[0], cloud]) #visualize the best grasp
 
@@ -219,7 +219,7 @@ class GraspPredictor:
             filtered_grippers = self.filtered_gg.to_open3d_geometry_list()
             for filtered_gripper in filtered_grippers:
                 filtered_gripper.transform(trans_mat)  
-            rospy.loginfo('Visualizing filtered grasps...')
+            rospy.loginfo('(Anygrasp) Visualizing filtered grasps...')
             o3d.visualization.draw_geometries([*filtered_grippers, cloud]) 
 
     def br_grasps(self):
@@ -243,7 +243,7 @@ class GraspPredictor:
             tf_list.append(tf_grasp)
             tf_list.append(tf_pregrasp)
 
-        rospy.loginfo_once(f'Publishing grasps...')
+        rospy.loginfo_once(f'(Anygrasp) Publishing grasps...')
         self.br.sendTransform(tf_list)
 
 if __name__ == '__main__':
