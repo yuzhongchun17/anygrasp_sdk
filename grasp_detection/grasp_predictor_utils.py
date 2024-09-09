@@ -37,6 +37,21 @@ def get_cam_ee_rotation() -> np.ndarray:
                             [0, 1, 0]])
     return Rot_cam_ee
 
+def get_offset_grasp_center_3d(grasp_i, offset =-0.02, axis ='z') -> np.ndarray:
+    """
+    Get the grasp center offset by 2cm in the negative z direction
+    """
+    # return the grasp center offset by 2cm in the negative z direction
+    grasp_center_position = grasp_i.translation
+    grasp_frame_orientation = grasp_i.rotation
+    if axis == 'x':
+        return grasp_center_position - offset * grasp_frame_orientation[:,0]
+    elif axis == 'y':
+        return grasp_center_position - offset * grasp_frame_orientation[:,1]
+    elif axis == 'z':
+        return grasp_center_position - offset * grasp_frame_orientation[:,2]
+    
+    
 def visualize_pcd(rgb_image, depth_image, camera_info):
     """
     Visualize a point cloud from RGB and depth images.
