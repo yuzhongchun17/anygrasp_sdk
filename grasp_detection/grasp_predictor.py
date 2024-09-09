@@ -168,6 +168,7 @@ class GraspPredictor:
 
         rospy.loginfo(f'(Anygrasp) Number of grasps: {len(self.gg)}')
 
+
     
     def filter_grasp(self, num_grasp=5):
         """
@@ -181,7 +182,9 @@ class GraspPredictor:
         for i in range(len(self.gg)):
             grasp_center_3d = self.gg[i].translation 
             grasp_center_2d = utils.project_3d_to_2d(grasp_center_3d, self.camera_info_lt) 
-            if utils.is_grasp_within_mask(grasp_center_2d, self.grasp_mask):
+            # TODO: (test needed) add grasp_center_3d offset by 2cm in negative z direction
+            grasp_center_offset_2d = utils.project_3d_to_2d(self.gg[i], self.camera_info_lt)
+            if utils.is_grasp_within_mask(grasp_center_2d, self.grasp_mask) or utils.is_grasp_within_mask(grasp_center_offset_2d, self.grasp_mask):
                 filtered_gg_index.append(i)
         filtered_gg = self.gg[filtered_gg_index]
 
