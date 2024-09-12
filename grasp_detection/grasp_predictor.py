@@ -21,6 +21,10 @@ from hl2ss_ros_utils import prepare_tf_msg
 
 import grasp_predictor_utils as utils
 
+WORKSPACE_Z_MIN = 0.5
+WORKSPACE_Z_MAX = 1.2
+
+
 # Parse terminal input
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -35,6 +39,10 @@ def parse_arguments():
 class GraspPredictor:
     def __init__(self, cfgs):
         self.cfgs = cfgs
+        # Initialize AnyGrasp model --------------------------------------------------
+        self.anygrasp = AnyGrasp(cfgs)
+        self.anygrasp.load_net()
+        rospy.loginfo_once('(Anygrasp) Anygrasp model loaded')
 
         # Initialize variables
         self.depth_image = None
@@ -53,9 +61,10 @@ class GraspPredictor:
         self.filtered_gg = None # will store filtered grasps
         self.cloud = None # will store the point cloud
     
+        # ROS ----------------------------------------------------------
         rospy.init_node('Anygrasp', anonymous=True)
         rospy.loginfo_once('(Anygrasp) Anygrasp node initialized')
-        # ROS ----------------------------------------------------------
+        
         # Initialize the CvBridge and TF2 listener
         self.bridge = CvBridge()
         self.tf_buffer = tf2_ros.Buffer()
@@ -65,15 +74,13 @@ class GraspPredictor:
         self.rgb_sub = message_filters.Subscriber('/hololens2/goal_image_pv_remap', Image)
         self.depth_sub = message_filters.Subscriber('/hololens2/goal_image_lt', Image)
         self.info_sub = message_filters.Subscriber('/hololens2/goal_camerainfo_lt', CameraInfo)
-
-        # Set up a TimeSynchronizer (for sync sub)
         self.ts = message_filters.TimeSynchronizer([self.rgb_sub, self.depth_sub, self.info_sub], 10)
         self.ts.registerCallback(self.callback)
 
-        self.br = TransformBroadcaster()
-        self.timer = rospy.Timer(rospy.Duration(0.5), self.timer_callback)  # Adjust duration as needed
-
         self.grasp_mask_sub = rospy.Subscriber('/hololens2/grasp_mask', Image, self.mask_callback)
+
+        self.br = TransformBroadcaster()
+        self.emg_sub = rospy.Subscriber('/emg', String, self.emg_callback)
 
     # Check functions --------------------------------------------------    
     def is_grasp_mask_ready(self):
@@ -88,7 +95,7 @@ class GraspPredictor:
     def is_filtered_grasp_predicted(self):
         return self.filtered_gg is not None
     # Reset functions --------------------------------------------------
-    # TODO: figure out the reset logic (onlyl needed in sam2_clientn to stop publihing goals)
+    # TODO: figure out the reset logic (only needed in sam2_client to stop publihing goals)
     # TODO: and in mask handler to stop publishing mask
 
     # Callbacks ---------------------------------------------------------                                           
@@ -109,21 +116,22 @@ class GraspPredictor:
         except Exception as e:
             rospy.logerr(f"(Anygrasp) Error processing synchronized messages: {str(e)}")
 
-    def timer_callback(self, event):
-        rospy.loginfo_once('(Anygrasp) Timer callback triggered')
-        if self.is_rgbd_info_ready() and not self.is_grasp_predicted():
-            # NOTE: RGBD ready, but grasp not predicted yet
-            # utils.visualize_pcd(self.rgb_image, self.depth_image, self.camera_info)
-            self.predict_grasp() # update self.gg (once)
+    def emg_callback(self, emg_msg):
+        if emg_msg.data == 'hand_close':
+            rospy.loginfo('(Anygrasp) Emg trigger receieved, starting grasp prediction...')
+            if self.is_rgbd_info_ready() and not self.is_grasp_predicted():
+                self.predict_grasp() # update self.gg (once)
+            rospy.sleep(0.2) # buffer time to set flag
 
-        if self.is_grasp_mask_ready() and self.is_grasp_predicted() and not self.is_filtered_grasp_predicted():
-            # NOTE: Grasp mask ready, grasps predicted, but not filtered yet
-            self.filter_grasp() # update self.filtered_gg (once)
+            if self.is_grasp_mask_ready() and self.is_grasp_predicted() and not self.is_filtered_grasp_predicted():
+                self.filter_grasp() # update self.filtered_gg (once)
+            rospy.sleep(0.2) # buffer time to set flag
 
-        if self.is_filtered_grasp_predicted():
-            if cfgs.debug:
-                self.visualize_grasps()
-            self.br_grasps()
+            if self.is_filtered_grasp_predicted():
+                if cfgs.debug:
+                    self.visualize_grasps()
+                self.br_grasps()
+            rospy.loginfo_once('(Anygrasp) Grasp prediction finished, broadcasting grasp tf...')    
 
     # Main functions ----------------------------------------------------
     def predict_grasp(self):
@@ -131,8 +139,6 @@ class GraspPredictor:
         Predict grasps using the AnyGrasp model
         update: self.gg, self.cloud
         """
-        anygrasp = AnyGrasp(cfgs)
-        anygrasp.load_net()
        
         # Get the point cloud from RGBD + CameraInfo
         fx, fy, cx, cy, scale = self.camera_info_lt.K[0], self.camera_info_lt.K[4], self.camera_info_lt.K[2], self.camera_info_lt.K[5], 1
@@ -143,7 +149,7 @@ class GraspPredictor:
         points_y = (ymap - cy) / fy * points_z
 
         # Set workspace to crop point cloud
-        mask = (points_z > 0.3) & (points_z < 1)
+        mask = (points_z > WORKSPACE_Z_MIN) & (points_z < WORKSPACE_Z_MAX)
         points = np.stack([points_x, points_y, points_z], axis=-1)
         points = points[mask].astype(np.float32)
         colors = self.rgb_image[mask].astype(np.float32) / 255.0 # change to [0,1] from [0,255]
@@ -157,7 +163,7 @@ class GraspPredictor:
         zmax = points_z.max()
         lims = [xmin, xmax, ymin, ymax, zmin, zmax]
 
-        gg, cloud = anygrasp.get_grasp(points, colors, lims=lims, apply_object_mask=True, dense_grasp=False, collision_detection=True)
+        gg, cloud = self.anygrasp.get_grasp(points, colors, lims=lims, apply_object_mask=True, dense_grasp=False, collision_detection=True)
         if len(gg) == 0:
             print('(Anygrasp) No Grasp detected after collision detection!')
         gg = gg.nms().sort_by_score()
@@ -167,8 +173,6 @@ class GraspPredictor:
         self.cloud = cloud 
 
         rospy.loginfo(f'(Anygrasp) Number of grasps: {len(self.gg)}')
-
-
     
     def filter_grasp(self, num_grasp=5):
         """
@@ -182,8 +186,9 @@ class GraspPredictor:
         for i in range(len(self.gg)):
             grasp_center_3d = self.gg[i].translation 
             grasp_center_2d = utils.project_3d_to_2d(grasp_center_3d, self.camera_info_lt) 
-            # TODO: (test needed) add grasp_center_3d offset by 2cm in negative z direction
-            grasp_center_offset_2d = utils.project_3d_to_2d(self.gg[i], self.camera_info_lt)
+            # Get grasp center offset onto object for more accurate mask check
+            grasp_center_offset_3d = utils.get_offset_grasp_center_3d(self.gg[i])
+            grasp_center_offset_2d = utils.project_3d_to_2d(grasp_center_offset_3d, self.camera_info_lt)
             if utils.is_grasp_within_mask(grasp_center_2d, self.grasp_mask) or utils.is_grasp_within_mask(grasp_center_offset_2d, self.grasp_mask):
                 filtered_gg_index.append(i)
         filtered_gg = self.gg[filtered_gg_index]
@@ -225,6 +230,7 @@ class GraspPredictor:
             rospy.loginfo('(Anygrasp) Visualizing filtered grasps...')
             o3d.visualization.draw_geometries([*filtered_grippers, cloud]) 
 
+
     def br_grasps(self):
         """
         Publish all the grasps and pregrasps as tf relative to lt_tmp
@@ -239,12 +245,7 @@ class GraspPredictor:
                                       grasp.translation, 
                                       rot_in_ee_frame)
             
-            tf_pregrasp = prepare_tf_msg(f'grasp_{i}', f'pregrasp_{i}',
-                                        None,
-                                        [0,0,-0.10],
-                                        [0,0,0,1])
             tf_list.append(tf_grasp)
-            tf_list.append(tf_pregrasp)
 
         rospy.loginfo_once(f'(Anygrasp) Publishing grasps...')
         self.br.sendTransform(tf_list)
