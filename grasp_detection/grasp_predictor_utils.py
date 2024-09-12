@@ -43,7 +43,7 @@ def get_offset_grasp_center_3d(grasp_i, offset =-0.02, axis ='z') -> np.ndarray:
     """
     # return the grasp center offset by 2cm in the negative z direction
     grasp_center_position = grasp_i.translation
-    grasp_frame_orientation = grasp_i.rotation
+    grasp_frame_orientation = grasp_i.rotation_matrix
     if axis == 'x':
         return grasp_center_position - offset * grasp_frame_orientation[:,0]
     elif axis == 'y':
