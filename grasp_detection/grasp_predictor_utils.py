@@ -3,11 +3,25 @@ import numpy as np
 from PIL import Image
 import open3d as o3d
 
-def is_grasp_within_mask(grasp_center_2d, grasp_mask) -> bool:
+def is_grasp_within_mask(grasp_center_2d, grasp_mask, padding: int = 0) -> bool:
     '''
     Check if the grasp center is within the grasp mask
     '''
     x, y = grasp_center_2d
+    # print(x, y)
+    # print(grasp_mask.shape)
+    if padding != 0:
+        # zero pad the grasp mask
+        grasp_mask = cv2.copyMakeBorder(grasp_mask, padding, padding, padding, padding, cv2.BORDER_CONSTANT, value=0)
+        # check all pixels within padding radius of the grasp center
+        # for i in range(y - padding, y + padding + 1):
+        #     for j in range(x - padding, x + padding + 1):
+        #         if grasp_mask[x+i, y+j] == 255:
+        #             return True
+        for i in range(- padding, padding + 1):
+            for j in range(- padding, padding + 1):
+                if grasp_mask[y+i, x+j] == 255:
+                    return True
     return grasp_mask[y, x] == 255
 
 def get_bbox(mask) -> tuple:

@@ -4,10 +4,11 @@ import numpy as np
 import cv2
 from cv_bridge import CvBridge
 import open3d as o3d
+import matplotlib.pyplot as plt
 
 import rospy
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, Vector3Stamped
 from std_msgs.msg import Bool, String
 from tf2_ros import TransformBroadcaster, TransformListener
 import tf2_ros
@@ -23,7 +24,8 @@ import grasp_predictor_utils as utils
 
 WORKSPACE_Z_MIN = 0.5
 WORKSPACE_Z_MAX = 1.2
-
+GRASP_MASK_PADDING = 0
+NUM_GRASPS = 5
 
 # Parse terminal input
 def parse_arguments():
@@ -74,21 +76,26 @@ class GraspPredictor:
         self.rgb_sub = message_filters.Subscriber('/hololens2/goal_image_pv_remap', Image)
         self.depth_sub = message_filters.Subscriber('/hololens2/goal_image_lt', Image)
         self.info_sub = message_filters.Subscriber('/hololens2/goal_camerainfo_lt', CameraInfo)
-        self.gaze_sub = message_filters.Subscriber('/hololens2/gaze_eet', String)
-        
-        self.index_sub = message_filters.Subscriber('/hololens2/goal_index_tip', String)
-        self.middle_sub = message_filters.Subscriber('/hololens2/goal_middle_tip', String)
-        self.thumb_sub = message_filters.Subscriber('/hololens2/goal_thumb_tip', String)
+
+        # # Subscribe to gaze and hand points for POTENTIAL FIELD
+        # self.gaze_sub = message_filters.Subscriber('/hololens2/goal_gaze_eet', Vector3Stamped)
+        # self.index_sub = message_filters.Subscriber('/hololens2/goal_index_tip', Vector3Stamped)
+        # self.middle_sub = message_filters.Subscriber('/hololens2/goal_middle_tip', Vector3Stamped)
+        # self.thumb_sub = message_filters.Subscriber('/hololens2/goal_thumb_tip', Vector3Stamped)
 
 
         # Set up a TimeSynchronizer (for sync sub)
-        self.ts = message_filters.TimeSynchronizer([self.rgb_sub, self.depth_sub, self.info_sub, self.gaze_sub, self.index_sub, self.middle_sub, self.thumb_sub], 10)
+        # self.ts = message_filters.ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub, self.info_sub, self.gaze_sub, self.index_sub, self.middle_sub, self.thumb_sub], 10, slop=0.1)
+        self.ts = message_filters.TimeSynchronizer([self.rgb_sub, self.depth_sub, self.info_sub], 10)
         self.ts.registerCallback(self.callback)
+
+        # rospy.sleep(10) # wait for the first message to arrive
 
         self.grasp_mask_sub = rospy.Subscriber('/hololens2/grasp_mask', Image, self.mask_callback)
 
         self.br = TransformBroadcaster()
         self.emg_sub = rospy.Subscriber('/emg', String, self.emg_callback)
+        # self.timer = rospy.Timer(rospy.Duration(3), self.timer_callback)
 
     # Check functions --------------------------------------------------    
     def is_grasp_mask_ready(self):
@@ -114,36 +121,82 @@ class GraspPredictor:
         except Exception as e:
             rospy.logerr(f"(Anygrasp) Error processing grasp mask msg: {str(e)}")  
    
+    # # Sync callback
+    # def callback(self, rgb_msg, depth_msg, info_msg, gaze_msg, index_msg, middle_msg, thumb_msg):
+    #     try:
+    #         print('Received synchronized messages')
+    #         self.rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "rgb8") 
+    #         self.depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "32FC1")
+    #         self.camera_info_lt = info_msg 
+    #         self.gaze = [gaze_msg.vector.x, gaze_msg.vector.y]
+    #         self.index = [index_msg.vector.x, index_msg.vector.y]
+    #         self.middle = [middle_msg.vector.x, middle_msg.vector.y]
+    #         self.thumb = [thumb_msg.vector.x, thumb_msg.vector.y]
+            
+    #     except Exception as e:
+    #         rospy.logerr(f"(Anygrasp) Error processing synchronized messages: {str(e)}")
+    
     # Sync callback
-    def callback(self, rgb_msg, depth_msg, info_msg, gaze_msg, index_msg, middle_msg, thumb_msg):
+    def callback(self, rgb_msg, depth_msg, info_msg):
         try:
+            print('Received synchronized messages')
             self.rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "rgb8") 
             self.depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "32FC1")
             self.camera_info_lt = info_msg 
-            self.gaze = gaze_msg
-            self.index = index_msg
-            self.middle = middle_msg
-            self.thumb = thumb_msg
-
+            
         except Exception as e:
             rospy.logerr(f"(Anygrasp) Error processing synchronized messages: {str(e)}")
 
     def emg_callback(self, emg_msg):
         if emg_msg.data == 'hand_close':
-            rospy.loginfo('(Anygrasp) Emg trigger receieved, starting grasp prediction...')
+            rospy.loginfo('(Anygrasp) Emg trigger receieved')
             if self.is_rgbd_info_ready() and not self.is_grasp_predicted():
+                rospy.loginfo('(Anygrasp) Starting grasp prediction...')
                 self.predict_grasp() # update self.gg (once)
             rospy.sleep(0.2) # buffer time to set flag
 
             if self.is_grasp_mask_ready() and self.is_grasp_predicted() and not self.is_filtered_grasp_predicted():
-                self.filter_grasp(use_potential_field=True) # update self.filtered_gg (once)
+                rospy.loginfo('(Anygrasp) Filtering grasps...')
+                self.filter_grasp(use_potential_field=False) # update self.filtered_gg (once)
             rospy.sleep(0.2) # buffer time to set flag
 
-            if self.is_filtered_grasp_predicted():
-                if cfgs.debug:
-                    self.visualize_grasps()
-                self.br_grasps()
-            rospy.loginfo_once('(Anygrasp) Grasp prediction finished, broadcasting grasp tf...')    
+            # if self.is_filtered_grasp_predicted():
+            #     if cfgs.debug:
+            #         self.visualize_grasps()
+            #     self.br_grasps()
+            #     rospy.loginfo_once('(Anygrasp) Grasp prediction finished, broadcasting grasp tf...') 
+
+    # def timer_callback(self, event):
+    #     if self.is_filtered_grasp_predicted:
+    #         if cfgs.debug:
+    #             self.visualize_grasps()
+    #         self.br_grasps()
+    #         rospy.loginfo_once('(Anygrasp) Grasp prediction finished, broadcasting grasp tf...')
+    #         self.br_grasps()            
+
+    # def emg_callback(self, emg_msg):
+    #     if emg_msg.data == 'hand_close':
+    #         rospy.loginfo('(Anygrasp) Emg trigger receieved')
+    #         if self.is_rgbd_info_ready() and not self.is_grasp_predicted():
+    #             rospy.loginfo('(Anygrasp) Starting grasp prediction...')
+    #             self.predict_grasp() # update self.gg (once)
+    #         else:
+    #             rospy.loginfo(f'(Anygrasp) Grasp prediction already done {self.is_grasp_predicted()} or RGBD info not ready {not self.is_rgbd_info_ready()}')
+    #         rospy.sleep(0.2) # buffer time to set flag
+
+    #         if self.is_grasp_mask_ready() and self.is_grasp_predicted() and not self.is_filtered_grasp_predicted():
+    #             rospy.loginfo('(Anygrasp) Filtering grasps...')
+    #             self.filter_grasp(use_potential_field=False) # update self.filtered_gg (once)
+    #         else:
+    #             rospy.loginfo(f'(Anygrasp) Grasp mask not ready {self.is_grasp_mask_ready()} or Grasp prediction not done {self.is_grasp_predicted()} or Filtered grasp already done {not self.is_filtered_grasp_predicted()}')
+    #         rospy.sleep(0.2) # buffer time to set flag
+
+    #         if self.is_filtered_grasp_predicted():
+    #             if cfgs.debug:
+    #                 self.visualize_grasps()
+    #             self.br_grasps()
+    #         if self.is_filtered_grasp_predicted():
+    #             rospy.loginfo_once('(Anygrasp) Grasp prediction finished, broadcasting grasp tf...')    
 
     # Main functions ----------------------------------------------------
     def predict_grasp(self):
@@ -187,7 +240,7 @@ class GraspPredictor:
         rospy.loginfo(f'(Anygrasp) Number of grasps: {len(self.gg)}')
 
    
-    def filter_grasp(self, num_grasp=5, use_potential_field=True, location_weighting = 1, grasp_quality_weighting = 3, gaze_to_hand_weighting_ratio = 0.8):
+    def filter_grasp(self, num_grasp=NUM_GRASPS, use_potential_field=True, location_weighting = 1.0, grasp_quality_weighting = 0.3, gaze_to_hand_weighting_ratio = 0.2):
         """
         Filter grasps based on the grasp mask
         
@@ -203,23 +256,42 @@ class GraspPredictor:
             # Get grasp center offset onto object for more accurate mask check
             grasp_center_offset_3d = utils.get_offset_grasp_center_3d(self.gg[i])
             grasp_center_offset_2d = utils.project_3d_to_2d(grasp_center_offset_3d, self.camera_info_lt)
-            grasp_centers_offset_2d_arr.append(grasp_center_offset_2d)
-            if utils.is_grasp_within_mask(grasp_center_2d, self.grasp_mask) or utils.is_grasp_within_mask(grasp_center_offset_2d, self.grasp_mask):
+
+            if utils.is_grasp_within_mask(grasp_center_2d, self.grasp_mask, padding = GRASP_MASK_PADDING) or utils.is_grasp_within_mask(grasp_center_offset_2d, self.grasp_mask, padding = GRASP_MASK_PADDING):
                 filtered_gg_index.append(i)
+                grasp_centers_offset_2d_arr.append(grasp_center_offset_2d)
         filtered_gg = self.gg[filtered_gg_index]
+        rospy.loginfo(f'(Anygrasp) Number of filtered grasps based on mask: {len(filtered_gg)}')
 
         # TODO: test potential field
-        if use_potential_field:
-            filtered_adjusted_gg = filtered_gg
+        if use_potential_field and filtered_gg is not None:
+            rospy.loginfo(f'(Anygrasp) Using potential field to adjust grasp scores...')
+            # filtered_adjusted_gg = filtered_gg
             location_scores = []
-            normalized_weights = [location_weighting, grasp_quality_weighting]/(location_weighting + grasp_quality_weighting)
-            
+            print('location_weighting:', location_weighting)
+            print('grasp_quality_weighting:', grasp_quality_weighting)
+            print('total weight:', location_weighting + grasp_quality_weighting)
+            normalized_weights = [location_weighting/(location_weighting + grasp_quality_weighting), grasp_quality_weighting/(location_weighting + grasp_quality_weighting)]
+            rospy.loginfo('(Anygrasp) Normalized weights for location and grasp quality: ')
             for grasp_center_offset_2d in grasp_centers_offset_2d_arr:
                 location_scores.append(self.adjust_grasp_scores(grasp_center_offset_2d, gaze_to_hand_weighting_ratio*location_weighting, (1-gaze_to_hand_weighting_ratio)*location_weighting))
             # normalize the location scores and grasp quality scores 
             normalized_location_scores = location_scores / np.sum(location_scores)
             normalized_grasp_quality_scores = filtered_gg.scores / np.sum(filtered_gg.scores)
             normalized_scores = np.dot(normalized_weights, [normalized_location_scores, normalized_grasp_quality_scores])
+            rospy.loginfo(f'(Anygrasp) Original grasp scores: {filtered_gg.scores}')
+            rospy.loginfo(f'(Anygrasp) Location scores: {location_scores}')
+            rospy.loginfo(f'(Anygrasp) Normalized scores: {normalized_scores}')
+            rospy.loginfo(f'(Anygrasp) Coordinates: {grasp_centers_offset_2d_arr}')
+            # draw the image with the grasp centers and score labels
+                        
+            for i in range(len(grasp_centers_offset_2d_arr)):
+                cv2.circle(self.rgb_image, grasp_centers_offset_2d_arr[i], 5, (0, 255, 0), -1)
+                cv2.putText(self.rgb_image, f'{normalized_scores[i]:.2f}', grasp_centers_offset_2d_arr[i], cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.imwrite('grasps_scores_test.jpg', self.rgb_image)
+            cv2.imshow('Grasps with scores', self.rgb_image)
+                    
+            filtered_adjusted_gg = filtered_gg
             for i in range(len(filtered_gg)):
                 filtered_adjusted_gg[i].score = normalized_scores[i] 
             # sort the grasps by the adjusted scores
@@ -234,14 +306,12 @@ class GraspPredictor:
             rospy.loginfo(f'(Anygrasp) Number of filtered grasps is {len(filtered_gg)}, returning top {num_grasp} grasps')
             self.filtered_gg = filtered_gg[0:num_grasp]    
 
-    def evaluate_potential_field(point, node, attract_grasp = True):
+    def evaluate_potential_field(self, point_x, point_y, node_x, node_y, attract_grasp):
         """
         Evaluate the potential field at a point (x, y) with mode (u, v) acting as an attractor or repulsor
         """
         # Assume inverse square law
-        u, v = point[0], point[1]
-        x, y = node[0], node[1]
-        f = 1 / ((x - u)**2 + (y - v)**2)
+        f = 1 / ((float(point_x) - node_x)**2 + (float(point_y) - node_y)**2)
         if attract_grasp:
             return f
         else:
@@ -256,13 +326,14 @@ class GraspPredictor:
         # Assume each potential field is inversely proportional to the distance from its source or sink node 
         # The distances used in calculating each potential field are normalized by the characteristic dimension of the object
         x, y, w, h = cv2.boundingRect(self.grasp_mask)
-        object_size = np.linalg([w, h]) 
-        gaze_location_score = self.evaluate_potential_field(grasp_center_2d, self.gaze, attract_grasp = True) * object_size**2
-        index_location_score = self.evaluate_potential_field(grasp_center_2d, self.index, attract_grasp = False) * object_size**2
-        middle_location_score = self.evaluate_potential_field(grasp_center_2d, self.middle, attract_grasp = False) * object_size**2
-        thumb_location_score = self.evaluate_potential_field(grasp_center_2d, self.thumb, attract_grasp = False) * object_size**2
+        object_size = np.linalg.norm([w, h]) 
+        gaze_location_score = self.evaluate_potential_field(grasp_center_2d[0], grasp_center_2d[1], self.gaze[0], self.gaze[1], True) * object_size**2
+        index_location_score = self.evaluate_potential_field(grasp_center_2d[0], grasp_center_2d[1], self.index[0], self.index[1], False) * object_size**2
+        middle_location_score = self.evaluate_potential_field(grasp_center_2d[0], grasp_center_2d[1], self.middle[0], self.middle[1], False) * object_size**2
+        thumb_location_score = self.evaluate_potential_field(grasp_center_2d[0], grasp_center_2d[1], self.thumb[0], self.thumb[1], False) * object_size**2
         # location scores are now dimensionless, normalize the weights
-        weights = [gaze_weighting, fingertip_weighting/3, fingertip_weighting/3, fingertip_weighting/3]/(gaze_weighting + fingertip_weighting)
+        factor = (gaze_weighting + fingertip_weighting)
+        weights = [gaze_weighting/factor, fingertip_weighting/3/factor, fingertip_weighting/3/factor, fingertip_weighting/3/factor]
         location_score = np.dot(weights, [gaze_location_score, index_location_score, middle_location_score, thumb_location_score])
         # grasp_quality_score = grasp_quality_weighting * grasp_score
         return location_score #+ grasp_quality_score
@@ -310,9 +381,28 @@ class GraspPredictor:
                                       None, 
                                       grasp.translation, 
                                       rot_in_ee_frame)
+
+            # Add waypoints between pregrasp and grasp
+            tf_grasp_wp1 = prepare_tf_msg(f'grasp_{i}', f'grasp_{i}'+'wp1',
+                                    None,
+                                    [0,0,-0.5],
+                                    [0,0,0,1])
+            
+            tf_grasp_wp2 = prepare_tf_msg(f'grasp_{i}', f'grasp_{i}'+'wp2',
+                                    None,
+                                    [0,0,-0.10],
+                                    [0,0,0,1])
+            
+            tf_pregrasp = prepare_tf_msg(f'grasp_{i}', f'pregrasp_{i}',
+                                    None,
+                                    [0,0,-0.15],
+                                    [0,0,0,1])
             
             tf_list.append(tf_grasp)
-
+            tf_list.append(tf_pregrasp)
+            tf_list.append(tf_grasp_wp1)
+            tf_list.append(tf_grasp_wp2)
+            
         rospy.loginfo_once(f'(Anygrasp) Publishing grasps...')
         self.br.sendTransform(tf_list)
 
@@ -320,4 +410,12 @@ if __name__ == '__main__':
     cfgs = parse_arguments()
     cfgs.max_gripper_width = max(0, min(0.1, cfgs.max_gripper_width))
     handler = GraspPredictor(cfgs)
-    rospy.spin()
+
+    while not rospy.is_shutdown():
+        if handler.is_filtered_grasp_predicted():
+            if cfgs.debug:
+                handler.visualize_grasps()
+            handler.br_grasps()
+            rospy.loginfo_once('(Anygrasp) Grasp prediction finished, broadcasting grasp tf...')
+
+    # rospy.spin()
