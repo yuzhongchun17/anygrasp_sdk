@@ -1,0 +1,296 @@
+"""
+anygrasp_sam3_stream.py
+-----------------------
+Subscribes to the segmented RGBD stream published by SAM3 on tcp://localhost:5560,
+builds a point cloud from each frame, and runs AnyGrasp to detect grasps.
+
+Usage:
+    python3 anygrasp_sam3_stream.py --checkpoint_path /path/to/checkpoint.tar [options]
+"""
+
+import argparse
+import json
+import math
+import sys
+import os
+
+import zmq
+import msgpack
+import numpy as np
+import cv2
+
+# AnyGrasp lives in the grasp_detection sub-directory
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "grasp_detection"))
+from gsnet import AnyGrasp
+
+# ── Camera intrinsics table (from cam_intrinsics.json) ───────────────────────
+CAM_INTRINSICS = {
+    "left":         dict(fx=690.12060546875,    fy=690.3575439453125,  cx=640.8505859375,   cy=361.0849304199219),
+    "right":        dict(fx=691.2072143554688,  fy=691.3511962890625,  cx=639.8049926757812, cy=362.0535888671875),
+    "right_camera": dict(fx=1034.4736328125,    fy=1034.5303955078125, cx=963.7049560546875, cy=544.0369873046875),
+    "eye":          dict(fx=610.3641357421875,  fy=610.4464721679688,  cx=634.84619140625,   cy=362.1564025878906),
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument('--checkpoint_path', required=True, help='AnyGrasp checkpoint (.tar)')
+parser.add_argument('--max_gripper_width', type=float, default=0.08,
+                    help='UFACTORY xArm Gripper: position range 0-800 × 0.1 mm/unit = 80 mm max')
+parser.add_argument('--gripper_height',    type=float, default=0.06,
+                    help='UFACTORY xArm Gripper finger height ≈ 60 mm')
+parser.add_argument('--top_down_grasp',    action='store_true')
+parser.add_argument('--debug',             action='store_true', help='Open3D visualisation')
+parser.add_argument('--cam', choices=list(CAM_INTRINSICS.keys()), default='left',
+                    help='Camera name — sets fx/fy/cx/cy from built-in table')
+# Per-axis overrides (only needed to deviate from the --cam defaults)
+parser.add_argument('--fx', type=float, default=None)
+parser.add_argument('--fy', type=float, default=None)
+parser.add_argument('--cx', type=float, default=None)
+parser.add_argument('--cy', type=float, default=None)
+parser.add_argument('--depth_scale', type=float, default=1000.0,
+                    help='Depth units → metres (1000 for mm, 1 for m)')
+parser.add_argument('--zmq_addr', default='tcp://localhost:5560')
+parser.add_argument('--zmq_pub_addr', default='tcp://*:5561',
+                    help='ZMQ address to publish best grasp on')
+parser.add_argument('--top_k', type=int, default=10, help='Number of top grasps to keep')
+parser.add_argument('--calib', default='../richtech-dex-open/code/calib_output/calib_result_left',
+                    help='Path to calib_result JSON file (contains T_cam2gripper)')
+parser.add_argument('--arm', choices=['left', 'right'], default='left',
+                    help='Which arm to read EE pose from')
+parser.add_argument('--no_robot', action='store_true',
+                    help='Skip robot connection (prints cam-frame pose only)')
+cfgs = parser.parse_args()
+cfgs.max_gripper_width = max(0, min(0.1, cfgs.max_gripper_width))
+
+# Apply camera intrinsics from table, then allow per-axis CLI overrides
+_intr = CAM_INTRINSICS[cfgs.cam]
+if cfgs.fx is None: cfgs.fx = _intr['fx']
+if cfgs.fy is None: cfgs.fy = _intr['fy']
+if cfgs.cx is None: cfgs.cx = _intr['cx']
+if cfgs.cy is None: cfgs.cy = _intr['cy']
+print(f"[cam] {cfgs.cam}  fx={cfgs.fx}  fy={cfgs.fy}  cx={cfgs.cx}  cy={cfgs.cy}")
+
+# ── Hand-eye calibration ──────────────────────────────────────────────────────
+def _load_calib(path: str) -> np.ndarray:
+    with open(path) as f:
+        data = json.load(f)
+    return np.array(data['T_cam2gripper'])
+
+def _rpy_to_matrix(roll_deg, pitch_deg, yaw_deg):
+    """ZYX Euler (degrees) -> 3x3 rotation matrix (R = Rz * Ry * Rx)."""
+    r, p, y = math.radians(roll_deg), math.radians(pitch_deg), math.radians(yaw_deg)
+    Rx = np.array([[1,0,0],[0,math.cos(r),-math.sin(r)],[0,math.sin(r),math.cos(r)]])
+    Ry = np.array([[math.cos(p),0,math.sin(p)],[0,1,0],[-math.sin(p),0,math.cos(p)]])
+    Rz = np.array([[math.cos(y),-math.sin(y),0],[math.sin(y),math.cos(y),0],[0,0,1]])
+    return Rz @ Ry @ Rx
+
+def get_T_gripper2base(robot, arm: str) -> np.ndarray:
+    """Returns 4x4 T_gripper2base from current EE pose."""
+    cart = getattr(robot, arm).current_cartesian_pos  # [x,y,z mm, roll,pitch,yaw deg]
+    if cart is False:
+        raise RuntimeError(f"rm_get_current_arm_state failed for {arm} arm")
+    x, y, z, roll, pitch, yaw = cart
+    T = np.eye(4)
+    T[:3, :3] = _rpy_to_matrix(roll, pitch, yaw)
+    T[:3, 3]  = [x / 1000.0, y / 1000.0, z / 1000.0]
+    return T
+
+if not os.path.isfile(cfgs.calib):
+    raise FileNotFoundError(
+        f"Calib file not found: {cfgs.calib}\n"
+        f"Run hand_eye_calib.py first, then pass the result with --calib <path>"
+    )
+T_cam2gripper = _load_calib(cfgs.calib)
+print(f"[calib] Loaded T_cam2gripper from {cfgs.calib}")
+
+robot = None
+if not cfgs.no_robot:
+    import os as _os
+    from richtech_dex_open import env as _env
+    _os.environ[_env.RICHTECH_NO_GRIPPER_ENV_NAME] = 'True'
+    from richtech_dex_open.robot.robot import RobotWithArms
+    robot = RobotWithArms.get_robot_instance(enable_robot=False)
+    print(f"[robot] Connected. Using '{cfgs.arm}' arm for EE pose.")
+else:
+    print("[robot] --no_robot set — base-frame transform will be skipped.")
+
+# ── AnyGrasp ─────────────────────────────────────────────────────────────────
+print(f"[anygrasp] Loading checkpoint: {cfgs.checkpoint_path}")
+anygrasp = AnyGrasp(cfgs)
+anygrasp.load_net()
+print("[anygrasp] Network ready.")
+
+# ── ZMQ subscriber + grasp publisher ─────────────────────────────────────────
+ctx = zmq.Context()
+sub = ctx.socket(zmq.SUB)
+sub.setsockopt(zmq.CONFLATE, 1)          # keep only the latest frame
+sub.connect(cfgs.zmq_addr)
+sub.setsockopt_string(zmq.SUBSCRIBE, "")
+print(f"[zmq] Subscribed to {cfgs.zmq_addr}. Waiting for SAM3 frames… (Ctrl-C to quit)")
+
+pub = ctx.socket(zmq.PUB)
+pub.bind(cfgs.zmq_pub_addr)
+print(f"[zmq] Publishing best grasp on {cfgs.zmq_pub_addr}")
+
+
+def depth_to_pointcloud(depth, color_rgb, fx, fy, cx, cy, scale):
+    """Return (points, colors) arrays with background (depth==0) removed."""
+    h, w = depth.shape
+    xmap, ymap = np.meshgrid(np.arange(w), np.arange(h))
+
+    z = depth / scale                       # metres
+    x = (xmap - cx) / fx * z
+    y = (ymap - cy) / fy * z
+
+    points = np.stack([x, y, z], axis=-1)  # (H, W, 3)
+    colors = color_rgb.astype(np.float32) / 255.0
+
+    # Mask: keep only foreground pixels (depth > 0) within a sane range
+    mask = (z > 0) & (z < 2.0)
+    return points[mask].astype(np.float32), colors[mask].astype(np.float32)
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+frame_idx = 0
+try:
+    while True:
+        # ---- receive --------------------------------------------------------
+        try:
+            raw = sub.recv(zmq.NOBLOCK)
+        except zmq.error.Again:
+            continue
+
+        data = msgpack.unpackb(raw)
+
+        # ---- decode colour --------------------------------------------------
+        print("[debug] keys:", list(data.keys()))
+        color_buf = data['color_img']
+        color_bgr = cv2.imdecode(np.frombuffer(color_buf, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if color_bgr is None:
+            print("[warn] Failed to decode colour frame — skipping.")
+            continue
+        color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+
+        # ---- decode depth ---------------------------------------------------
+        depth_shape = data['depth_shape']   # [H, W]
+        depth_raw   = data['depth_raw']
+        prompt      = data['prompt']
+        if isinstance(prompt, bytes):
+            prompt = prompt.decode()
+
+        if depth_shape[0] == 0 or len(depth_raw) == 0:
+            print("[warn] Empty depth — skipping.")
+            continue
+
+        depth = np.frombuffer(depth_raw, dtype=np.uint16).reshape(depth_shape[0], depth_shape[1])
+
+        frame_idx += 1
+        print(f"\n[frame {frame_idx}] prompt='{prompt}'  depth shape={depth.shape}")
+
+        # ---- build point cloud ----------------------------------------------
+        points, colors = depth_to_pointcloud(
+            depth, color_rgb,
+            cfgs.fx, cfgs.fy, cfgs.cx, cfgs.cy, cfgs.depth_scale
+        )
+
+        if len(points) < 10:
+            print("[warn] Too few foreground points — skipping.")
+            continue
+
+        print(f"[pcd] {len(points)} foreground points  "
+              f"XYZ min={points.min(axis=0)}  max={points.max(axis=0)}")
+
+        # ---- workspace limits from point cloud extents ----------------------
+        lims = [
+            float(points[:, 0].min()), float(points[:, 0].max()),
+            float(points[:, 1].min()), float(points[:, 1].max()),
+            float(points[:, 2].min()), float(points[:, 2].max()),
+        ]
+
+        # ---- AnyGrasp inference ---------------------------------------------
+        gg, cloud = anygrasp.get_grasp(
+            points, colors,
+            lims=lims,
+            apply_object_mask=True,
+            dense_grasp=False,
+            collision_detection=True,
+        )
+
+        if gg is None or len(gg) == 0:
+            print("[anygrasp] No grasps detected after collision filtering.")
+            continue
+
+        gg = gg.nms().sort_by_score()
+        gg_pick = gg[: cfgs.top_k]
+
+        print(f"[anygrasp] {len(gg)} grasps found. Top-{len(gg_pick)} scores: {gg_pick.scores}")
+
+        best = gg_pick[0]
+        np.set_printoptions(precision=4, suppress=True)
+        print(f"[anygrasp] Best grasp (rank 1 of {len(gg)}):")
+        print(f"  score     : {best.score:.4f}")
+        print(f"  width     : {best.width:.4f} m")
+        print(f"  translation (cam): {best.translation}")
+        print(f"  rotation   (cam):\n{best.rotation_matrix}")
+
+        # ---- transform to robot base frame ----------------------------------
+        T_grasp_cam = np.eye(4)
+        T_grasp_cam[:3, :3] = best.rotation_matrix
+        T_grasp_cam[:3, 3]  = best.translation
+
+        # ---- read EE pose at image-capture time ---------------------------------
+        ee_cartesian = None
+        if robot is not None:
+            try:
+                ee_cartesian = getattr(robot, cfgs.arm).current_cartesian_pos
+            except Exception as e:
+                print(f"  [warn] Could not read EE pose for ZMQ message: {e}")
+
+        # ---- publish best grasp (cam frame) + EE pose at capture time --------
+        pub.send(msgpack.packb({
+            "translation":   best.translation.tolist(),
+            "rotation":      best.rotation_matrix.tolist(),
+            "score":         float(best.score),
+            "width":         float(best.width),
+            "frame_idx":     frame_idx,
+            "prompt":        prompt,
+            "ee_cartesian":  ee_cartesian,   # [x mm, y mm, z mm, roll deg, pitch deg, yaw deg] at capture time
+        }))
+        print(f"[zmq pub] Sent best grasp (score={best.score:.4f})  ee={ee_cartesian}")
+
+        if robot is not None:
+            try:
+                T_gripper2base = get_T_gripper2base(robot, cfgs.arm)
+                T_grasp_base   = T_gripper2base @ T_cam2gripper @ T_grasp_cam
+                print(f"  translation (base): {T_grasp_base[:3, 3]}")
+                print(f"  rotation   (base):\n{T_grasp_base[:3, :3]}")
+            except Exception as e:
+                print(f"  [warn] Could not get EE pose: {e}")
+
+        # ---- optional Open3D visualisation ----------------------------------
+        if cfgs.debug:
+            import open3d as o3d
+            trans_mat = np.array([[1,0,0,0],[0,1,0,0],[0,0,-1,0],[0,0,0,1]])
+            cloud.transform(trans_mat)
+            grippers = gg_pick.to_open3d_geometry_list()
+            for g in grippers:
+                g.transform(trans_mat)
+            # First window: top-K grasps
+            o3d.visualization.draw_geometries(
+                [*grippers, cloud],
+                window_name=f"AnyGrasp | frame {frame_idx} | Top-{len(gg_pick)} | prompt: {prompt}"
+            )
+            # Second window: top-1 grasp only
+            o3d.visualization.draw_geometries(
+                [grippers[0], cloud],
+                window_name=f"AnyGrasp | frame {frame_idx} | Top-1 | prompt: {prompt}"
+            )
+
+
+except KeyboardInterrupt:
+    print("\n[info] Interrupted — exiting.")
+finally:
+    sub.close()
+    pub.close()
+    ctx.term()
+    print("[info] Subscriber closed.")
