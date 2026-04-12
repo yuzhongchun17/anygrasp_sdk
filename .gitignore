@@ -6,3 +6,11 @@
 .DS_Store
 .TimeRecord
 license
+
+# Build artifacts
+pointnet2/build/
+
+# Run outputs
+grasp_detection/log/
+grasp_detection/wire_output/
+grasp_tracking/log/
