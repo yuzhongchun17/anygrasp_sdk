@@ -5,11 +5,10 @@ Subscribes to the segmented RGBD stream published by SAM3 on tcp://localhost:556
 builds a point cloud from each frame, and runs AnyGrasp to detect grasps.
 
 Usage:
-    python3 anygrasp_sam3_stream.py --checkpoint_path /path/to/checkpoint.tar [options]
+    python3 anygrasp_sam3_stream.py [options]
 """
 
 import argparse
-import json
 import math
 import sys
 import os
@@ -33,7 +32,7 @@ CAM_INTRINSICS = {
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument('--checkpoint_path', required=True, help='AnyGrasp checkpoint (.tar)')
+parser.add_argument('--checkpoint_path', default='grasp_detection/log/checkpoint_detection.tar', help='AnyGrasp checkpoint (.tar)')
 parser.add_argument('--max_gripper_width', type=float, default=0.08,
                     help='UFACTORY xArm Gripper: position range 0-800 × 0.1 mm/unit = 80 mm max')
 parser.add_argument('--gripper_height',    type=float, default=0.06,
@@ -53,12 +52,10 @@ parser.add_argument('--zmq_addr', default='tcp://localhost:5560')
 parser.add_argument('--zmq_pub_addr', default='tcp://*:5561',
                     help='ZMQ address to publish best grasp on')
 parser.add_argument('--top_k', type=int, default=10, help='Number of top grasps to keep')
-parser.add_argument('--calib', default='../richtech-dex-open/code/calib_output/calib_result_left',
-                    help='Path to calib_result JSON file (contains T_cam2gripper)')
 parser.add_argument('--arm', choices=['left', 'right'], default='left',
                     help='Which arm to read EE pose from')
 parser.add_argument('--no_robot', action='store_true',
-                    help='Skip robot connection (prints cam-frame pose only)')
+                    help='Skip robot connection')
 cfgs = parser.parse_args()
 cfgs.max_gripper_width = max(0, min(0.1, cfgs.max_gripper_width))
 
@@ -69,12 +66,6 @@ if cfgs.fy is None: cfgs.fy = _intr['fy']
 if cfgs.cx is None: cfgs.cx = _intr['cx']
 if cfgs.cy is None: cfgs.cy = _intr['cy']
 print(f"[cam] {cfgs.cam}  fx={cfgs.fx}  fy={cfgs.fy}  cx={cfgs.cx}  cy={cfgs.cy}")
-
-# ── Hand-eye calibration ──────────────────────────────────────────────────────
-def _load_calib(path: str) -> np.ndarray:
-    with open(path) as f:
-        data = json.load(f)
-    return np.array(data['T_cam2gripper'])
 
 def _rpy_to_matrix(roll_deg, pitch_deg, yaw_deg):
     """ZYX Euler (degrees) -> 3x3 rotation matrix (R = Rz * Ry * Rx)."""
@@ -94,14 +85,6 @@ def get_T_gripper2base(robot, arm: str) -> np.ndarray:
     T[:3, :3] = _rpy_to_matrix(roll, pitch, yaw)
     T[:3, 3]  = [x / 1000.0, y / 1000.0, z / 1000.0]
     return T
-
-if not os.path.isfile(cfgs.calib):
-    raise FileNotFoundError(
-        f"Calib file not found: {cfgs.calib}\n"
-        f"Run hand_eye_calib.py first, then pass the result with --calib <path>"
-    )
-T_cam2gripper = _load_calib(cfgs.calib)
-print(f"[calib] Loaded T_cam2gripper from {cfgs.calib}")
 
 robot = None
 if not cfgs.no_robot:
@@ -238,7 +221,7 @@ try:
         T_grasp_cam[:3, :3] = best.rotation_matrix
         T_grasp_cam[:3, 3]  = best.translation
 
-        # ---- read EE pose at image-capture time ---------------------------------
+        # ---- read EE pose at image-capture time -----------------------------
         ee_cartesian = None
         if robot is not None:
             try:
@@ -246,7 +229,7 @@ try:
             except Exception as e:
                 print(f"  [warn] Could not read EE pose for ZMQ message: {e}")
 
-        # ---- publish best grasp (cam frame) + EE pose at capture time --------
+        # ---- publish best grasp (cam frame) + EE pose at capture time -------
         pub.send(msgpack.packb({
             "translation":   best.translation.tolist(),
             "rotation":      best.rotation_matrix.tolist(),
@@ -254,18 +237,9 @@ try:
             "width":         float(best.width),
             "frame_idx":     frame_idx,
             "prompt":        prompt,
-            "ee_cartesian":  ee_cartesian,   # [x mm, y mm, z mm, roll deg, pitch deg, yaw deg] at capture time
+            "ee_cartesian":  ee_cartesian,
         }))
         print(f"[zmq pub] Sent best grasp (score={best.score:.4f})  ee={ee_cartesian}")
-
-        if robot is not None:
-            try:
-                T_gripper2base = get_T_gripper2base(robot, cfgs.arm)
-                T_grasp_base   = T_gripper2base @ T_cam2gripper @ T_grasp_cam
-                print(f"  translation (base): {T_grasp_base[:3, 3]}")
-                print(f"  rotation   (base):\n{T_grasp_base[:3, :3]}")
-            except Exception as e:
-                print(f"  [warn] Could not get EE pose: {e}")
 
         # ---- optional Open3D visualisation ----------------------------------
         if cfgs.debug:
