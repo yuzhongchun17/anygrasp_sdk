@@ -9,7 +9,6 @@ Usage:
 """
 
 import argparse
-import math
 import sys
 import os
 
@@ -52,10 +51,6 @@ parser.add_argument('--zmq_addr', default='tcp://localhost:5560')
 parser.add_argument('--zmq_pub_addr', default='tcp://*:5561',
                     help='ZMQ address to publish best grasp on')
 parser.add_argument('--top_k', type=int, default=10, help='Number of top grasps to keep')
-parser.add_argument('--arm', choices=['left', 'right'], default='left',
-                    help='Which arm to read EE pose from')
-parser.add_argument('--no_robot', action='store_true',
-                    help='Skip robot connection')
 cfgs = parser.parse_args()
 cfgs.max_gripper_width = max(0, min(0.1, cfgs.max_gripper_width))
 
@@ -66,36 +61,6 @@ if cfgs.fy is None: cfgs.fy = _intr['fy']
 if cfgs.cx is None: cfgs.cx = _intr['cx']
 if cfgs.cy is None: cfgs.cy = _intr['cy']
 print(f"[cam] {cfgs.cam}  fx={cfgs.fx}  fy={cfgs.fy}  cx={cfgs.cx}  cy={cfgs.cy}")
-
-def _rpy_to_matrix(roll_deg, pitch_deg, yaw_deg):
-    """ZYX Euler (degrees) -> 3x3 rotation matrix (R = Rz * Ry * Rx)."""
-    r, p, y = math.radians(roll_deg), math.radians(pitch_deg), math.radians(yaw_deg)
-    Rx = np.array([[1,0,0],[0,math.cos(r),-math.sin(r)],[0,math.sin(r),math.cos(r)]])
-    Ry = np.array([[math.cos(p),0,math.sin(p)],[0,1,0],[-math.sin(p),0,math.cos(p)]])
-    Rz = np.array([[math.cos(y),-math.sin(y),0],[math.sin(y),math.cos(y),0],[0,0,1]])
-    return Rz @ Ry @ Rx
-
-def get_T_gripper2base(robot, arm: str) -> np.ndarray:
-    """Returns 4x4 T_gripper2base from current EE pose."""
-    cart = getattr(robot, arm).current_cartesian_pos  # [x,y,z mm, roll,pitch,yaw deg]
-    if cart is False:
-        raise RuntimeError(f"rm_get_current_arm_state failed for {arm} arm")
-    x, y, z, roll, pitch, yaw = cart
-    T = np.eye(4)
-    T[:3, :3] = _rpy_to_matrix(roll, pitch, yaw)
-    T[:3, 3]  = [x / 1000.0, y / 1000.0, z / 1000.0]
-    return T
-
-robot = None
-if not cfgs.no_robot:
-    import os as _os
-    from richtech_dex_open import env as _env
-    _os.environ[_env.RICHTECH_NO_GRIPPER_ENV_NAME] = 'True'
-    from richtech_dex_open.robot.robot import RobotWithArms
-    robot = RobotWithArms.get_robot_instance(enable_robot=False)
-    print(f"[robot] Connected. Using '{cfgs.arm}' arm for EE pose.")
-else:
-    print("[robot] --no_robot set — base-frame transform will be skipped.")
 
 # ── AnyGrasp ─────────────────────────────────────────────────────────────────
 print(f"[anygrasp] Loading checkpoint: {cfgs.checkpoint_path}")
@@ -216,20 +181,7 @@ try:
         print(f"  translation (cam): {best.translation}")
         print(f"  rotation   (cam):\n{best.rotation_matrix}")
 
-        # ---- transform to robot base frame ----------------------------------
-        T_grasp_cam = np.eye(4)
-        T_grasp_cam[:3, :3] = best.rotation_matrix
-        T_grasp_cam[:3, 3]  = best.translation
-
-        # ---- read EE pose at image-capture time -----------------------------
-        ee_cartesian = None
-        if robot is not None:
-            try:
-                ee_cartesian = getattr(robot, cfgs.arm).current_cartesian_pos
-            except Exception as e:
-                print(f"  [warn] Could not read EE pose for ZMQ message: {e}")
-
-        # ---- publish best grasp (cam frame) + EE pose at capture time -------
+        # ---- publish best grasp (cam frame) ---------------------------------
         pub.send(msgpack.packb({
             "translation":   best.translation.tolist(),
             "rotation":      best.rotation_matrix.tolist(),
@@ -237,9 +189,8 @@ try:
             "width":         float(best.width),
             "frame_idx":     frame_idx,
             "prompt":        prompt,
-            "ee_cartesian":  ee_cartesian,
         }))
-        print(f"[zmq pub] Sent best grasp (score={best.score:.4f})  ee={ee_cartesian}")
+        print(f"[zmq pub] Sent best grasp (score={best.score:.4f})")
 
         # ---- optional Open3D visualisation ----------------------------------
         if cfgs.debug:
