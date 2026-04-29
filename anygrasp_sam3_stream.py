@@ -36,7 +36,7 @@ parser.add_argument('--max_gripper_width', type=float, default=0.08,
                     help='UFACTORY xArm Gripper: position range 0-800 × 0.1 mm/unit = 80 mm max')
 parser.add_argument('--gripper_height',    type=float, default=0.06,
                     help='UFACTORY xArm Gripper finger height ≈ 60 mm')
-parser.add_argument('--top_down_grasp',    action='store_true')
+parser.add_argument('--top_down_grasp',    action='store_true', default=True)
 parser.add_argument('--debug',             action='store_true', help='Open3D visualisation')
 parser.add_argument('--cam', choices=list(CAM_INTRINSICS.keys()), default='left',
                     help='Camera name — sets fx/fy/cx/cy from built-in table')
